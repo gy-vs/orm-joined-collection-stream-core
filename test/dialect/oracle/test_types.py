@@ -1,0 +1,2069 @@
+import array
+import datetime
+import decimal
+import functools
+import json
+import os
+import random
+
+from sqlalchemy import bindparam
+from sqlalchemy import cast
+from sqlalchemy import CHAR
+from sqlalchemy import DATE
+from sqlalchemy import Date
+from sqlalchemy import DateTime
+from sqlalchemy import Double
+from sqlalchemy import DOUBLE_PRECISION
+from sqlalchemy import event
+from sqlalchemy import exc
+from sqlalchemy import FLOAT
+from sqlalchemy import Float
+from sqlalchemy import Index
+from sqlalchemy import Integer
+from sqlalchemy import LargeBinary
+from sqlalchemy import literal
+from sqlalchemy import MetaData
+from sqlalchemy import NCHAR
+from sqlalchemy import Numeric
+from sqlalchemy import NVARCHAR
+from sqlalchemy import schema
+from sqlalchemy import select
+from sqlalchemy import SmallInteger
+from sqlalchemy import String
+from sqlalchemy import testing
+from sqlalchemy import Text
+from sqlalchemy import text
+from sqlalchemy import TIMESTAMP
+from sqlalchemy import TypeDecorator
+from sqlalchemy import types as sqltypes
+from sqlalchemy import Unicode
+from sqlalchemy import UnicodeText
+from sqlalchemy import VARCHAR
+from sqlalchemy.dialects.oracle import base as oracle
+from sqlalchemy.dialects.oracle import cx_oracle
+from sqlalchemy.dialects.oracle import oracledb
+from sqlalchemy.dialects.oracle import SparseVector
+from sqlalchemy.dialects.oracle import VECTOR
+from sqlalchemy.dialects.oracle import VectorDistanceType
+from sqlalchemy.dialects.oracle import VectorIndexConfig
+from sqlalchemy.dialects.oracle import VectorIndexType
+from sqlalchemy.dialects.oracle import VectorStorageFormat
+from sqlalchemy.dialects.oracle import VectorStorageType
+from sqlalchemy.sql import column
+from sqlalchemy.sql.sqltypes import NullType
+from sqlalchemy.testing import AssertsCompiledSQL
+from sqlalchemy.testing import eq_
+from sqlalchemy.testing import expect_raises_message
+from sqlalchemy.testing import fixtures
+from sqlalchemy.testing import is_
+from sqlalchemy.testing import mock
+from sqlalchemy.testing.engines import testing_engine
+from sqlalchemy.testing.schema import Column
+from sqlalchemy.testing.schema import Table
+from sqlalchemy.testing.suite import test_types as suite
+from sqlalchemy.util import b
+from sqlalchemy.util.concurrency import await_
+
+
+def exec_sql(conn, sql, *args, **kwargs):
+    return conn.exec_driver_sql(sql, *args, **kwargs)
+
+
+class DialectTypesTest(fixtures.TestBase, AssertsCompiledSQL):
+    __dialect__ = oracle.OracleDialect()
+
+    def test_no_clobs_for_string_params(self):
+        """test that simple string params get a DBAPI type of
+        VARCHAR, not CLOB. This is to prevent setinputsizes
+        from setting up cx_oracle.CLOBs on
+        string-based bind params [ticket:793]."""
+
+        class FakeDBAPI:
+            def __getattr__(self, attr):
+                return attr
+
+        dialect = oracle.OracleDialect()
+        dbapi = FakeDBAPI()
+
+        b = bindparam("foo", "hello world!")
+        eq_(b.type.dialect_impl(dialect).get_dbapi_type(dbapi), "STRING")
+
+        b = bindparam("foo", "hello world!")
+        eq_(b.type.dialect_impl(dialect).get_dbapi_type(dbapi), "STRING")
+
+    def test_long(self):
+        self.assert_compile(oracle.LONG(), "LONG")
+
+    @testing.combinations(
+        (Date(), cx_oracle._CXOracleDate),
+        (oracle.OracleRaw(), cx_oracle._OracleRaw),
+        (String(), String),
+        (VARCHAR(), cx_oracle._OracleString),
+        (DATE(), cx_oracle._CXOracleDate),
+        (oracle.DATE(), oracle.DATE),
+        (String(50), cx_oracle._OracleString),
+        (Unicode(), cx_oracle._OracleUnicodeStringCHAR),
+        (Text(), cx_oracle._OracleText),
+        (UnicodeText(), cx_oracle._OracleUnicodeTextCLOB),
+        (CHAR(), cx_oracle._OracleChar),
+        (NCHAR(), cx_oracle._OracleNChar),
+        (NVARCHAR(), cx_oracle._OracleUnicodeStringNCHAR),
+        (oracle.RAW(50), cx_oracle._OracleRaw),
+        argnames="start, test",
+    )
+    @testing.combinations(cx_oracle, oracledb, argnames="module")
+    def test_type_adapt(self, start, test, module):
+        dialect = module.dialect()
+
+        assert isinstance(
+            start.dialect_impl(dialect), test
+        ), "wanted %r got %r" % (test, start.dialect_impl(dialect))
+
+    @testing.variation(
+        "use_blob",
+        ["none", "true", "false", "dialect_support", "dialect_not_support"],
+    )
+    def test_json_types(self, use_blob):
+        if use_blob.none:
+            self.assert_compile(oracle.JSON(), "JSON")
+        elif use_blob.false:
+            self.assert_compile(oracle.JSON(use_blob=False), "JSON")
+        elif use_blob.true:
+            self.assert_compile(oracle.JSON(use_blob=True), "BLOB")
+        elif use_blob.dialect_support:
+            dialect = oracle.OracleDialect()
+            dialect._supports_oracle_json = True
+            self.assert_compile(oracle.JSON(), "JSON", dialect=dialect)
+
+            # test force override
+            self.assert_compile(
+                oracle.JSON(use_blob=True), "BLOB", dialect=dialect
+            )
+        elif use_blob.dialect_not_support:
+            dialect = oracle.OracleDialect()
+            dialect._supports_oracle_json = False
+            self.assert_compile(oracle.JSON(), "BLOB", dialect=dialect)
+
+            # test force override
+            self.assert_compile(
+                oracle.JSON(use_blob=False), "JSON", dialect=dialect
+            )
+
+    @testing.combinations(
+        (String(), String),
+        (VARCHAR(), cx_oracle._OracleString),
+        (String(50), cx_oracle._OracleString),
+        (Unicode(), cx_oracle._OracleUnicodeStringNCHAR),
+        (Text(), cx_oracle._OracleText),
+        (UnicodeText(), cx_oracle._OracleUnicodeTextNCLOB),
+        (NCHAR(), cx_oracle._OracleNChar),
+        (NVARCHAR(), cx_oracle._OracleUnicodeStringNCHAR),
+        argnames="start, test",
+    )
+    @testing.combinations(cx_oracle, oracledb, argnames="module")
+    def test_type_adapt_nchar(self, start, test, module):
+        dialect = module.dialect(use_nchar_for_unicode=True)
+
+        assert isinstance(
+            start.dialect_impl(dialect), test
+        ), "wanted %r got %r" % (test, start.dialect_impl(dialect))
+
+    def test_raw_compile(self):
+        self.assert_compile(oracle.RAW(), "RAW")
+        self.assert_compile(oracle.RAW(35), "RAW(35)")
+
+    def test_char_length(self):
+        self.assert_compile(VARCHAR(50), "VARCHAR(50 CHAR)")
+
+        oracle8dialect = oracle.dialect()
+        oracle8dialect.server_version_info = (8, 0)
+        self.assert_compile(VARCHAR(50), "VARCHAR(50)", dialect=oracle8dialect)
+
+        self.assert_compile(NVARCHAR(50), "NVARCHAR2(50)")
+        self.assert_compile(CHAR(50), "CHAR(50)")
+
+    @testing.combinations(
+        (String(50), "VARCHAR2(50 CHAR)"),
+        (Unicode(50), "VARCHAR2(50 CHAR)"),
+        (NVARCHAR(50), "NVARCHAR2(50)"),
+        (VARCHAR(50), "VARCHAR(50 CHAR)"),
+        (oracle.NVARCHAR2(50), "NVARCHAR2(50)"),
+        (oracle.VARCHAR2(50), "VARCHAR2(50 CHAR)"),
+        (String(), "VARCHAR2"),
+        (Unicode(), "VARCHAR2"),
+        (NVARCHAR(), "NVARCHAR2"),
+        (VARCHAR(), "VARCHAR"),
+        (oracle.NVARCHAR2(), "NVARCHAR2"),
+        (oracle.VARCHAR2(), "VARCHAR2"),
+    )
+    def test_varchar_types(self, typ, exp):
+        dialect = oracle.dialect()
+        self.assert_compile(typ, exp, dialect=dialect)
+
+    @testing.combinations(
+        (String(50), "VARCHAR2(50 CHAR)"),
+        (Unicode(50), "NVARCHAR2(50)"),
+        (NVARCHAR(50), "NVARCHAR2(50)"),
+        (VARCHAR(50), "VARCHAR(50 CHAR)"),
+        (oracle.NVARCHAR2(50), "NVARCHAR2(50)"),
+        (oracle.VARCHAR2(50), "VARCHAR2(50 CHAR)"),
+        (String(), "VARCHAR2"),
+        (Unicode(), "NVARCHAR2"),
+        (NVARCHAR(), "NVARCHAR2"),
+        (VARCHAR(), "VARCHAR"),
+        (oracle.NVARCHAR2(), "NVARCHAR2"),
+        (oracle.VARCHAR2(), "VARCHAR2"),
+    )
+    def test_varchar_use_nchar_types(self, typ, exp):
+        dialect = oracle.dialect(use_nchar_for_unicode=True)
+        self.assert_compile(typ, exp, dialect=dialect)
+
+    @testing.combinations(
+        (oracle.INTERVAL(), "INTERVAL DAY TO SECOND"),
+        (oracle.INTERVAL(day_precision=3), "INTERVAL DAY(3) TO SECOND"),
+        (oracle.INTERVAL(second_precision=5), "INTERVAL DAY TO SECOND(5)"),
+        (
+            oracle.INTERVAL(day_precision=2, second_precision=5),
+            "INTERVAL DAY(2) TO SECOND(5)",
+        ),
+        (
+            sqltypes.Interval(day_precision=9, second_precision=3),
+            "INTERVAL DAY(9) TO SECOND(3)",
+        ),
+    )
+    def test_interval(self, type_, expected):
+        self.assert_compile(type_, expected)
+
+    def test_interval_coercion_literal(self):
+        expr = column("bar", oracle.INTERVAL) == datetime.timedelta(days=1)
+        eq_(expr.right.type._type_affinity, sqltypes.Interval)
+
+    @testing.combinations(
+        ("sa", sqltypes.Float(), "FLOAT"),
+        ("sa", sqltypes.Double(), "DOUBLE PRECISION"),
+        ("sa", sqltypes.FLOAT(), "FLOAT"),
+        ("sa", sqltypes.REAL(), "REAL"),
+        ("sa", sqltypes.DOUBLE(), "DOUBLE"),
+        ("sa", sqltypes.DOUBLE_PRECISION(), "DOUBLE PRECISION"),
+        ("oracle", oracle.FLOAT(), "FLOAT"),
+        ("oracle", oracle.DOUBLE_PRECISION(), "DOUBLE PRECISION"),
+        ("oracle", oracle.REAL(), "REAL"),
+        ("oracle", oracle.BINARY_DOUBLE(), "BINARY_DOUBLE"),
+        ("oracle", oracle.BINARY_FLOAT(), "BINARY_FLOAT"),
+        id_="ira",
+    )
+    def test_float_type_compile(self, type_, sql_text):
+        self.assert_compile(type_, sql_text)
+
+    @testing.combinations(
+        (
+            text("select :parameter from dual").bindparams(
+                parameter=datetime.timedelta(days=2)
+            ),
+            "select NUMTODSINTERVAL(172800.0, 'SECOND') from dual",
+        ),
+        (
+            text("SELECT :parameter from dual").bindparams(
+                parameter=datetime.timedelta(days=1, minutes=3, seconds=4)
+            ),
+            "SELECT NUMTODSINTERVAL(86584.0, 'SECOND') from dual",
+        ),
+        (
+            text("select :parameter - :parameter2 from dual").bindparams(
+                parameter=datetime.timedelta(days=1, minutes=3, seconds=4),
+                parameter2=datetime.timedelta(days=0, minutes=1, seconds=4),
+            ),
+            (
+                "select NUMTODSINTERVAL(86584.0, 'SECOND') - "
+                "NUMTODSINTERVAL(64.0, 'SECOND') from dual"
+            ),
+        ),
+    )
+    def test_interval_literal_processor(self, type_, expected):
+        self.assert_compile(type_, expected, literal_binds=True)
+
+    def test_compile_boolean_native(self):
+        dialect = oracle.OracleDialect()
+        dialect.supports_native_boolean = True
+
+        t = Table(
+            "t",
+            MetaData(),
+            Column("x", sqltypes.Boolean),
+            Column("y", oracle.BOOLEAN),
+            Column(
+                "z", sqltypes.Boolean().with_variant(oracle.BOOLEAN, "oracle")
+            ),
+        )
+
+        self.assert_compile(
+            schema.CreateTable(t),
+            "CREATE TABLE t (x BOOLEAN, y BOOLEAN, z BOOLEAN)",
+            dialect=dialect,
+        )
+
+    def test_compile_boolean_emulated(self):
+        dialect = oracle.OracleDialect()
+        dialect.supports_native_boolean = False
+
+        t = Table(
+            "t",
+            MetaData(),
+            Column("x", sqltypes.Boolean),
+            Column("y", oracle.BOOLEAN),
+            Column(
+                "z", sqltypes.Boolean().with_variant(oracle.BOOLEAN, "oracle")
+            ),
+        )
+
+        self.assert_compile(
+            schema.CreateTable(t),
+            "CREATE TABLE t (x SMALLINT, y BOOLEAN, z BOOLEAN)",
+            dialect=dialect,
+        )
+
+
+class TypesTest(fixtures.TestBase):
+    __only_on__ = "oracle"
+    __dialect__ = oracle.OracleDialect()
+    __backend__ = True
+
+    @testing.combinations((CHAR,), (NCHAR,), argnames="char_type")
+    def test_fixed_char(self, metadata, connection, char_type):
+        m = metadata
+        t = Table(
+            "t1",
+            m,
+            Column("id", Integer, primary_key=True),
+            Column("data", char_type(30), nullable=False),
+        )
+        v1, v2, v3 = "value 1", "value 2", "value 3"
+
+        t.create(connection)
+        connection.execute(
+            t.insert(),
+            [
+                dict(id=1, data=v1),
+                dict(id=2, data=v2),
+                dict(id=3, data=v3),
+            ],
+        )
+
+        eq_(
+            connection.execute(t.select().where(t.c.data == v2)).fetchall(),
+            [(2, "value 2                       ")],
+        )
+
+        m2 = MetaData()
+        t2 = Table("t1", m2, autoload_with=connection)
+        is_(type(t2.c.data.type), char_type)
+        eq_(
+            connection.execute(t2.select().where(t2.c.data == v2)).fetchall(),
+            [(2, "value 2                       ")],
+        )
+
+    @testing.requires.insert_returning
+    def test_int_not_float(self, metadata, connection):
+        m = metadata
+        t1 = Table("t1", m, Column("foo", Integer))
+        t1.create(connection)
+        r = connection.execute(t1.insert().values(foo=5).returning(t1.c.foo))
+        x = r.scalar()
+        assert x == 5
+        assert isinstance(x, int)
+
+        x = connection.scalar(t1.select())
+        assert x == 5
+        assert isinstance(x, int)
+
+    @testing.requires.insert_returning
+    def test_int_not_float_no_coerce_decimal(self, metadata):
+        engine = testing_engine(options=dict(coerce_to_decimal=False))
+
+        m = metadata
+        t1 = Table("t1", m, Column("foo", Integer))
+        with engine.begin() as conn:
+            t1.create(conn)
+            r = conn.execute(t1.insert().values(foo=5).returning(t1.c.foo))
+            x = r.scalar()
+            assert x == 5
+            assert isinstance(x, int)
+
+            x = conn.execute(t1.select()).scalar()
+            assert x == 5
+            assert isinstance(x, int)
+
+    def test_integer_truediv(self, connection):
+        """test #4926"""
+
+        stmt = select(literal(1, Integer) / literal(2, Integer))
+        eq_(connection.scalar(stmt), decimal.Decimal("0.5"))
+
+    def test_rowid(self, metadata, connection):
+        t = Table("t1", metadata, Column("x", Integer))
+
+        t.create(connection)
+        connection.execute(t.insert(), {"x": 5})
+        s1 = select(t).subquery()
+        s2 = select(column("rowid")).select_from(s1)
+        rowid = connection.scalar(s2)
+
+        # the ROWID type is not really needed here,
+        # as cx_oracle just treats it as a string,
+        # but we want to make sure the ROWID works...
+        rowid_col = column("rowid", oracle.ROWID)
+        s3 = select(t.c.x, rowid_col).where(
+            rowid_col == cast(rowid, oracle.ROWID)
+        )
+        eq_(connection.execute(s3).fetchall(), [(5, rowid)])
+
+    def test_interval(self, metadata, connection):
+        interval_table = Table(
+            "intervaltable",
+            metadata,
+            Column(
+                "id", Integer, primary_key=True, test_needs_autoincrement=True
+            ),
+            Column("day_interval", oracle.INTERVAL(day_precision=3)),
+        )
+        metadata.create_all(connection)
+        connection.execute(
+            interval_table.insert(),
+            dict(day_interval=datetime.timedelta(days=35, seconds=5743)),
+        )
+        row = connection.execute(interval_table.select()).first()
+        eq_(
+            row._mapping["day_interval"],
+            datetime.timedelta(days=35, seconds=5743),
+        )
+
+    def test_interval_literal_processor(self, connection):
+        stmt = text("select :parameter - :parameter2 from dual")
+        result = connection.execute(
+            stmt.bindparams(
+                bindparam(
+                    "parameter",
+                    datetime.timedelta(days=1, minutes=3, seconds=4),
+                    literal_execute=True,
+                ),
+                bindparam(
+                    "parameter2",
+                    datetime.timedelta(days=0, minutes=1, seconds=4),
+                    literal_execute=True,
+                ),
+            )
+        ).one()
+        eq_(result[0], datetime.timedelta(days=1, seconds=120))
+
+    def test_no_decimal_float_precision(self):
+        with expect_raises_message(
+            exc.ArgumentError,
+            "Oracle Database FLOAT types use 'binary precision', which does "
+            "not convert cleanly from decimal 'precision'.  Please specify "
+            "this type with a separate Oracle Database variant, such as "
+            r"FLOAT\(precision=5\).with_variant\(oracle.FLOAT\("
+            r"binary_precision=16\), 'oracle'\), so that the Oracle "
+            "Database specific 'binary_precision' may be specified "
+            "accurately.",
+        ):
+            FLOAT(5).compile(dialect=oracle.dialect())
+
+    def test_numerics(self, metadata, connection):
+        m = metadata
+        t1 = Table(
+            "t1",
+            m,
+            Column("intcol", Integer),
+            Column("numericcol", Numeric(precision=9, scale=2)),
+            Column("floatcol1", Float()),
+            Column("floatcol2", FLOAT()),
+            Column("doubleprec1", DOUBLE_PRECISION),
+            Column("doubleprec2", Double()),
+            Column("numbercol1", oracle.NUMBER(9)),
+            Column("numbercol2", oracle.NUMBER(9, 3)),
+            Column("numbercol3", oracle.NUMBER),
+        )
+        t1.create(connection)
+        connection.execute(
+            t1.insert(),
+            dict(
+                intcol=1,
+                numericcol=5.2,
+                floatcol1=6.5,
+                floatcol2=8.5,
+                doubleprec1=9.5,
+                doubleprec2=14.5,
+                numbercol1=12,
+                numbercol2=14.85,
+                numbercol3=15.76,
+            ),
+        )
+
+        m2 = MetaData()
+        t2 = Table("t1", m2, autoload_with=connection)
+
+        for row in (
+            connection.execute(t1.select()).first(),
+            connection.execute(t2.select()).first(),
+        ):
+            for i, (val, type_) in enumerate(
+                (
+                    (1, int),
+                    (decimal.Decimal("5.2"), decimal.Decimal),
+                    (6.5, float),
+                    (8.5, float),
+                    (9.5, float),
+                    (14.5, float),
+                    (12, int),
+                    (decimal.Decimal("14.85"), decimal.Decimal),
+                    (15.76, float),
+                )
+            ):
+                eq_(row[i], val)
+                assert isinstance(row[i], type_), "%r is not %r" % (
+                    row[i],
+                    type_,
+                )
+
+    def test_numeric_infinity_float(self, metadata, connection):
+        m = metadata
+        t1 = Table(
+            "t1",
+            m,
+            Column("intcol", Integer),
+            Column("numericcol", oracle.BINARY_DOUBLE(asdecimal=False)),
+        )
+        t1.create(connection)
+        connection.execute(
+            t1.insert(),
+            [
+                dict(intcol=1, numericcol=float("inf")),
+                dict(intcol=2, numericcol=float("-inf")),
+            ],
+        )
+
+        eq_(
+            connection.execute(
+                select(t1.c.numericcol).order_by(t1.c.intcol)
+            ).fetchall(),
+            [(float("inf"),), (float("-inf"),)],
+        )
+
+        eq_(
+            exec_sql(
+                connection, "select numericcol from t1 order by intcol"
+            ).fetchall(),
+            [(float("inf"),), (float("-inf"),)],
+        )
+
+    def test_numeric_infinity_decimal(self, metadata, connection):
+        m = metadata
+        t1 = Table(
+            "t1",
+            m,
+            Column("intcol", Integer),
+            Column("numericcol", oracle.BINARY_DOUBLE(asdecimal=True)),
+        )
+        t1.create(connection)
+        connection.execute(
+            t1.insert(),
+            [
+                dict(intcol=1, numericcol=decimal.Decimal("Infinity")),
+                dict(intcol=2, numericcol=decimal.Decimal("-Infinity")),
+            ],
+        )
+
+        eq_(
+            connection.execute(
+                select(t1.c.numericcol).order_by(t1.c.intcol)
+            ).fetchall(),
+            [(decimal.Decimal("Infinity"),), (decimal.Decimal("-Infinity"),)],
+        )
+
+        eq_(
+            exec_sql(
+                connection, "select numericcol from t1 order by intcol"
+            ).fetchall(),
+            [(decimal.Decimal("Infinity"),), (decimal.Decimal("-Infinity"),)],
+        )
+
+    def test_numeric_nan_float(self, metadata, connection):
+        m = metadata
+        t1 = Table(
+            "t1",
+            m,
+            Column("intcol", Integer),
+            Column("numericcol", oracle.BINARY_DOUBLE(asdecimal=False)),
+        )
+        t1.create(connection)
+        connection.execute(
+            t1.insert(),
+            [
+                dict(intcol=1, numericcol=float("nan")),
+                dict(intcol=2, numericcol=float("-nan")),
+            ],
+        )
+
+        eq_(
+            [
+                tuple(str(col) for col in row)
+                for row in connection.execute(
+                    select(t1.c.numericcol).order_by(t1.c.intcol)
+                )
+            ],
+            [("nan",), ("nan",)],
+        )
+
+        eq_(
+            [
+                tuple(str(col) for col in row)
+                for row in exec_sql(
+                    connection, "select numericcol from t1 order by intcol"
+                )
+            ],
+            [("nan",), ("nan",)],
+        )
+
+    # needs https://github.com/oracle/python-cx_Oracle/
+    # issues/184#issuecomment-391399292
+    def _dont_test_numeric_nan_decimal(self, metadata, connection):
+        m = metadata
+        t1 = Table(
+            "t1",
+            m,
+            Column("intcol", Integer),
+            Column("numericcol", oracle.BINARY_DOUBLE(asdecimal=True)),
+        )
+        t1.create()
+        t1.insert().execute(
+            [
+                dict(intcol=1, numericcol=decimal.Decimal("NaN")),
+                dict(intcol=2, numericcol=decimal.Decimal("-NaN")),
+            ]
+        )
+
+        eq_(
+            select(t1.c.numericcol).order_by(t1.c.intcol).execute().fetchall(),
+            [(decimal.Decimal("NaN"),), (decimal.Decimal("NaN"),)],
+        )
+
+        eq_(
+            exec_sql(
+                connection, "select numericcol from t1 order by intcol"
+            ).fetchall(),
+            [(decimal.Decimal("NaN"),), (decimal.Decimal("NaN"),)],
+        )
+
+    def test_numerics_broken_inspection(self, metadata, connection):
+        """Numeric scenarios where Oracle Database type info is 'broken',
+        returning us precision, scale of the form (0, 0) or (0, -127).
+        We convert to Decimal and let int()/float() processors take over.
+
+        """
+
+        # this test requires cx_oracle 5
+
+        foo = Table(
+            "foo",
+            metadata,
+            Column("idata", Integer),
+            Column("ndata", Numeric(20, 2)),
+            Column("ndata2", Numeric(20, 2)),
+            Column("nidata", Numeric(5, 0)),
+            Column("fdata", Float()),
+        )
+        foo.create(connection)
+
+        connection.execute(
+            foo.insert(),
+            {
+                "idata": 5,
+                "ndata": decimal.Decimal("45.6"),
+                "ndata2": decimal.Decimal("45.0"),
+                "nidata": decimal.Decimal("53"),
+                "fdata": 45.68392,
+            },
+        )
+
+        stmt = "SELECT idata, ndata, ndata2, nidata, fdata FROM foo"
+
+        row = exec_sql(connection, stmt).fetchall()[0]
+        eq_(
+            [type(x) for x in row],
+            [int, decimal.Decimal, decimal.Decimal, int, float],
+        )
+        eq_(
+            row,
+            (
+                5,
+                decimal.Decimal("45.6"),
+                decimal.Decimal("45"),
+                53,
+                45.683920000000001,
+            ),
+        )
+
+        # with a nested subquery,
+        # both Numeric values that don't have decimal places, regardless
+        # of their originating type, come back as ints with no useful
+        # typing information beyond "numeric".  So native handler
+        # must convert to int.
+        # this means our Decimal converters need to run no matter what.
+        # totally sucks.
+
+        stmt = """
+        SELECT
+            (SELECT (SELECT idata FROM foo) FROM DUAL) AS idata,
+            (SELECT CAST((SELECT ndata FROM foo) AS NUMERIC(20, 2)) FROM DUAL)
+            AS ndata,
+            (SELECT CAST((SELECT ndata2 FROM foo) AS NUMERIC(20, 2)) FROM DUAL)
+            AS ndata2,
+            (SELECT CAST((SELECT nidata FROM foo) AS NUMERIC(5, 0)) FROM DUAL)
+            AS nidata,
+            (SELECT CAST((SELECT fdata FROM foo) AS FLOAT) FROM DUAL) AS fdata
+        FROM dual
+        """
+        row = exec_sql(connection, stmt).fetchall()[0]
+        eq_(
+            [type(x) for x in row],
+            [int, decimal.Decimal, int, int, decimal.Decimal],
+        )
+        eq_(
+            row,
+            (5, decimal.Decimal("45.6"), 45, 53, decimal.Decimal("45.68392")),
+        )
+
+        row = connection.execute(
+            text(stmt).columns(
+                idata=Integer(),
+                ndata=Numeric(20, 2),
+                ndata2=Numeric(20, 2),
+                nidata=Numeric(5, 0),
+                fdata=Float(),
+            )
+        ).fetchall()[0]
+        eq_(
+            [type(x) for x in row],
+            [int, decimal.Decimal, decimal.Decimal, decimal.Decimal, float],
+        )
+        eq_(
+            row,
+            (
+                5,
+                decimal.Decimal("45.6"),
+                decimal.Decimal("45"),
+                decimal.Decimal("53"),
+                45.683920000000001,
+            ),
+        )
+
+        stmt = """
+        SELECT
+                anon_1.idata AS anon_1_idata,
+                anon_1.ndata AS anon_1_ndata,
+                anon_1.ndata2 AS anon_1_ndata2,
+                anon_1.nidata AS anon_1_nidata,
+                anon_1.fdata AS anon_1_fdata
+        FROM (SELECT idata, ndata, ndata2, nidata, fdata
+        FROM (
+            SELECT
+                (SELECT (SELECT idata FROM foo) FROM DUAL) AS idata,
+                (SELECT CAST((SELECT ndata FROM foo) AS NUMERIC(20, 2))
+                FROM DUAL) AS ndata,
+                (SELECT CAST((SELECT ndata2 FROM foo) AS NUMERIC(20, 2))
+                FROM DUAL) AS ndata2,
+                (SELECT CAST((SELECT nidata FROM foo) AS NUMERIC(5, 0))
+                FROM DUAL) AS nidata,
+                (SELECT CAST((SELECT fdata FROM foo) AS FLOAT) FROM DUAL)
+                AS fdata
+            FROM dual
+        )
+        WHERE ROWNUM >= 0) anon_1
+        """
+        row = exec_sql(connection, stmt).fetchall()[0]
+        eq_(
+            [type(x) for x in row],
+            [int, decimal.Decimal, int, int, decimal.Decimal],
+        )
+        eq_(
+            row,
+            (5, decimal.Decimal("45.6"), 45, 53, decimal.Decimal("45.68392")),
+        )
+
+        row = connection.execute(
+            text(stmt).columns(
+                anon_1_idata=Integer(),
+                anon_1_ndata=Numeric(20, 2),
+                anon_1_ndata2=Numeric(20, 2),
+                anon_1_nidata=Numeric(5, 0),
+                anon_1_fdata=Float(),
+            )
+        ).fetchall()[0]
+        eq_(
+            [type(x) for x in row],
+            [int, decimal.Decimal, decimal.Decimal, decimal.Decimal, float],
+        )
+        eq_(
+            row,
+            (
+                5,
+                decimal.Decimal("45.6"),
+                decimal.Decimal("45"),
+                decimal.Decimal("53"),
+                45.683920000000001,
+            ),
+        )
+
+        row = connection.execute(
+            text(stmt).columns(
+                anon_1_idata=Integer(),
+                anon_1_ndata=Numeric(20, 2, asdecimal=False),
+                anon_1_ndata2=Numeric(20, 2, asdecimal=False),
+                anon_1_nidata=Numeric(5, 0, asdecimal=False),
+                anon_1_fdata=Float(asdecimal=True),
+            )
+        ).fetchall()[0]
+        eq_(
+            [type(x) for x in row], [int, float, float, float, decimal.Decimal]
+        )
+        eq_(row, (5, 45.6, 45, 53, decimal.Decimal("45.68392")))
+
+    def test_numeric_no_coerce_decimal_mode(self):
+        engine = testing_engine(options=dict(coerce_to_decimal=False))
+        with engine.connect() as conn:
+            # raw SQL no longer coerces to decimal
+            value = exec_sql(conn, "SELECT 5.66 FROM DUAL").scalar()
+            assert isinstance(value, float)
+
+            # explicit typing still *does* coerce to decimal
+            # (change in 1.2)
+            value = conn.scalar(
+                text("SELECT 5.66 AS foo FROM DUAL").columns(
+                    foo=Numeric(4, 2, asdecimal=True)
+                )
+            )
+            assert isinstance(value, decimal.Decimal)
+
+    def test_numeric_coerce_decimal_mode(self, connection):
+        # default behavior is raw SQL coerces to decimal
+        value = exec_sql(connection, "SELECT 5.66 FROM DUAL").scalar()
+        assert isinstance(value, decimal.Decimal)
+
+    @testing.combinations(
+        (
+            "Max 32-bit Number",
+            "SELECT CAST(2147483647 AS NUMBER(19,0)) FROM dual",
+        ),
+        (
+            "Min 32-bit Number",
+            "SELECT CAST(-2147483648 AS NUMBER(19,0)) FROM dual",
+        ),
+        (
+            "32-bit Integer Overflow",
+            "SELECT CAST(2147483648 AS NUMBER(19,0)) FROM dual",
+        ),
+        (
+            "32-bit Integer Underflow",
+            "SELECT CAST(-2147483649 AS NUMBER(19,0)) FROM dual",
+        ),
+        (
+            "Max Number with Precision 19",
+            "SELECT CAST(9999999999999999999 AS NUMBER(19,0)) FROM dual",
+        ),
+        (
+            "Min Number with Precision 19",
+            "SELECT CAST(-9999999999999999999 AS NUMBER(19,0)) FROM dual",
+        ),
+    )
+    @testing.only_on(
+        ["oracle+cx_oracle", "oracle+oracledb"],
+        "cx_oracle/oracledb specific feature",
+    )
+    def test_raw_numerics(self, title, stmt):
+        with testing.db.connect() as conn:
+            # get a brand new connection that definitely is not
+            # in the pool to avoid any outputtypehandlers
+            cx_oracle_raw = testing.db.pool._creator()
+            cursor = cx_oracle_raw.cursor()
+            cursor.execute(stmt)
+            cx_oracle_result = cursor.fetchone()[0]
+            cursor.close()
+
+            sqla_result = conn.exec_driver_sql(stmt).scalar()
+
+            eq_(sqla_result, cx_oracle_result)
+
+    def test_reflect_dates(self, metadata, connection):
+        Table(
+            "date_types",
+            metadata,
+            Column("d1", sqltypes.DATE),
+            Column("d2", oracle.DATE),
+            Column("d3", TIMESTAMP),
+            Column("d4", TIMESTAMP(timezone=True)),
+            Column("d5", oracle.INTERVAL(second_precision=5)),
+            Column("d6", oracle.TIMESTAMP(local_timezone=True)),
+        )
+        metadata.create_all(connection)
+        m = MetaData()
+        t1 = Table("date_types", m, autoload_with=connection)
+        assert isinstance(t1.c.d1.type, oracle.DATE)
+        assert isinstance(t1.c.d1.type, DateTime)
+        assert isinstance(t1.c.d2.type, oracle.DATE)
+        assert isinstance(t1.c.d2.type, DateTime)
+        assert isinstance(t1.c.d3.type, oracle.TIMESTAMP)
+        assert not t1.c.d3.type.timezone
+        assert isinstance(t1.c.d4.type, oracle.TIMESTAMP)
+        assert t1.c.d4.type.timezone
+        assert isinstance(t1.c.d6.type, oracle.TIMESTAMP)
+        assert t1.c.d6.type.local_timezone
+        assert isinstance(t1.c.d5.type, oracle.INTERVAL)
+
+    def _dont_test_reflect_all_types_schema(self):
+        types_table = Table(
+            "all_types",
+            MetaData(),
+            Column("owner", String(30), primary_key=True),
+            Column("type_name", String(30), primary_key=True),
+            autoload_with=testing.db,
+            oracle_resolve_synonyms=True,
+        )
+        for row in types_table.select().execute().fetchall():
+            [row[k] for k in row.keys()]
+
+    def test_raw_roundtrip(self, metadata, connection):
+        raw_table = Table(
+            "raw",
+            metadata,
+            Column("id", Integer, primary_key=True),
+            Column("data", oracle.RAW(35)),
+        )
+        metadata.create_all(connection)
+        connection.execute(raw_table.insert(), dict(id=1, data=b("ABCDEF")))
+        eq_(connection.execute(raw_table.select()).first(), (1, b("ABCDEF")))
+
+    def test_reflect_nvarchar(self, metadata, connection):
+        Table(
+            "tnv",
+            metadata,
+            Column("nv_data", sqltypes.NVARCHAR(255)),
+            Column("c_data", sqltypes.NCHAR(20)),
+        )
+        metadata.create_all(connection)
+        m2 = MetaData()
+        t2 = Table("tnv", m2, autoload_with=connection)
+        assert isinstance(t2.c.nv_data.type, sqltypes.NVARCHAR)
+        assert isinstance(t2.c.c_data.type, sqltypes.NCHAR)
+
+        if testing.against("oracle+cx_oracle", "oracle+oracledb"):
+            assert isinstance(
+                t2.c.nv_data.type.dialect_impl(connection.dialect),
+                cx_oracle._OracleUnicodeStringNCHAR,
+            )
+
+            assert isinstance(
+                t2.c.c_data.type.dialect_impl(connection.dialect),
+                cx_oracle._OracleNChar,
+            )
+
+        data = "m’a réveillé."
+        connection.execute(t2.insert(), dict(nv_data=data, c_data=data))
+        nv_data, c_data = connection.execute(t2.select()).first()
+        eq_(nv_data, data)
+        eq_(c_data, data + (" " * 7))  # char is space padded
+        assert isinstance(nv_data, str)
+        assert isinstance(c_data, str)
+
+    def test_reflect_unicode_no_nvarchar(self, metadata, connection):
+        Table("tnv", metadata, Column("data", sqltypes.Unicode(255)))
+        metadata.create_all(connection)
+        m2 = MetaData()
+        t2 = Table("tnv", m2, autoload_with=connection)
+        assert isinstance(t2.c.data.type, sqltypes.VARCHAR)
+
+        if testing.against("oracle+cx_oracle", "oracle+oracledb"):
+            assert isinstance(
+                t2.c.data.type.dialect_impl(connection.dialect),
+                cx_oracle._OracleString,
+            )
+
+        data = "m’a réveillé."
+        connection.execute(t2.insert(), {"data": data})
+        res = connection.execute(t2.select()).first().data
+        eq_(res, data)
+        assert isinstance(res, str)
+
+    def test_char_length(self, metadata, connection):
+        t1 = Table(
+            "t1",
+            metadata,
+            Column("c1", VARCHAR(50)),
+            Column("c2", NVARCHAR(250)),
+            Column("c3", CHAR(200)),
+            Column("c4", NCHAR(180)),
+        )
+        t1.create(connection)
+        m2 = MetaData()
+        t2 = Table("t1", m2, autoload_with=connection)
+        eq_(t2.c.c1.type.length, 50)
+        eq_(t2.c.c2.type.length, 250)
+        eq_(t2.c.c3.type.length, 200)
+        eq_(t2.c.c4.type.length, 180)
+
+    def test_long_type(self, metadata, connection):
+        t = Table("t", metadata, Column("data", oracle.LONG))
+        metadata.create_all(connection)
+        connection.execute(t.insert(), dict(data="xyz"))
+        eq_(connection.scalar(select(t.c.data)), "xyz")
+
+    def test_longstring(self, metadata, connection):
+        exec_sql(
+            connection,
+            """
+        CREATE TABLE Z_TEST
+        (
+          ID        NUMERIC(22) PRIMARY KEY,
+          ADD_USER  VARCHAR2(20)  NOT NULL
+        )
+        """,
+        )
+        try:
+            t = Table("z_test", metadata, autoload_with=connection)
+            connection.execute(t.insert(), dict(id=1.0, add_user="foobar"))
+            assert connection.execute(t.select()).fetchall() == [(1, "foobar")]
+        finally:
+            exec_sql(connection, "DROP TABLE Z_TEST")
+
+    @testing.requires.oracle_vector
+    def test_vector_dim(self, metadata, connection):
+        t1 = Table(
+            "t1",
+            metadata,
+            Column(
+                "c1", VECTOR(dim=3, storage_format=VectorStorageFormat.FLOAT32)
+            ),
+        )
+
+        t1.create(connection)
+        eq_(t1.c.c1.type.dim, 3)
+
+    @testing.requires.oracle_vector
+    def test_vector_insert(self, metadata, connection):
+        t1 = Table(
+            "t1",
+            metadata,
+            Column("id", Integer, primary_key=True),
+            Column("c1", VECTOR(storage_format=VectorStorageFormat.INT8)),
+        )
+
+        t1.create(connection)
+        connection.execute(
+            t1.insert(),
+            dict(id=1, c1=[6, 7, 8, 5]),
+        )
+        eq_(
+            connection.execute(t1.select()).first(),
+            (1, [6, 7, 8, 5]),
+        )
+        connection.execute(t1.delete().where(t1.c.id == 1))
+        connection.execute(t1.insert(), dict(id=1, c1=[6, 7]))
+        eq_(
+            connection.execute(t1.select()).first(),
+            (1, [6, 7]),
+        )
+
+    @testing.requires.oracle_vector
+    def test_vector_insert_array(self, metadata, connection):
+        t1 = Table(
+            "t1",
+            metadata,
+            Column("id", Integer, primary_key=True),
+            Column("c1", VECTOR),
+        )
+
+        t1.create(connection)
+        connection.execute(
+            t1.insert(),
+            dict(id=1, c1=array.array("b", [6, 7, 8, 5])),
+        )
+        eq_(
+            connection.execute(t1.select()).first(),
+            (1, [6, 7, 8, 5]),
+        )
+
+        connection.execute(t1.delete().where(t1.c.id == 1))
+
+        connection.execute(
+            t1.insert(), dict(id=1, c1=array.array("b", [6, 7]))
+        )
+        eq_(
+            connection.execute(t1.select()).first(),
+            (1, [6, 7]),
+        )
+
+    @testing.requires.oracle_vector
+    def test_vector_multiformat_insert(self, metadata, connection):
+        t1 = Table(
+            "t1",
+            metadata,
+            Column("id", Integer, primary_key=True),
+            Column("c1", VECTOR),
+        )
+
+        t1.create(connection)
+        connection.execute(
+            t1.insert(),
+            dict(id=1, c1=[6.12, 7.54, 8.33]),
+        )
+        eq_(
+            connection.execute(t1.select()).first(),
+            (1, [6.12, 7.54, 8.33]),
+        )
+        connection.execute(t1.delete().where(t1.c.id == 1))
+        connection.execute(t1.insert(), dict(id=1, c1=[6, 7]))
+        eq_(
+            connection.execute(t1.select()).first(),
+            (1, [6, 7]),
+        )
+
+    @testing.requires.oracle_vector
+    def test_vector_format(self, metadata, connection):
+        t1 = Table(
+            "t1",
+            metadata,
+            Column(
+                "c1", VECTOR(dim=3, storage_format=VectorStorageFormat.FLOAT32)
+            ),
+        )
+
+        t1.create(connection)
+        eq_(t1.c.c1.type.storage_format, VectorStorageFormat.FLOAT32)
+
+    @testing.requires.oracle_vector
+    def test_vector_hnsw_index(self, metadata, connection):
+        t1 = Table(
+            "t1",
+            metadata,
+            Column("id", Integer),
+            Column(
+                "embedding",
+                # can't specify dementions in the free version of oracle
+                # since otherwise it complains that has no space for the index
+                VECTOR(),
+                # VECTOR(dim=3, storage_format=VectorStorageFormat.FLOAT32),
+            ),
+        )
+
+        t1.create(connection)
+
+        hnsw_index = Index(
+            "hnsw_vector_index", t1.c.embedding, oracle_vector=True
+        )
+        hnsw_index.create(connection)
+
+        connection.execute(t1.insert(), dict(id=1, embedding=[6, 7, 8]))
+        eq_(
+            connection.execute(t1.select()).first(),
+            (1, [6.0, 7.0, 8.0]),
+        )
+
+    @testing.requires.oracle_vector
+    def test_vector_ivf_index(self, metadata, connection):
+        t1 = Table(
+            "t1",
+            metadata,
+            Column("id", Integer),
+            Column(
+                "embedding",
+                VECTOR(dim=3, storage_format=VectorStorageFormat.FLOAT32),
+            ),
+        )
+
+        t1.create(connection)
+        ivf_index = Index(
+            "ivf_vector_index",
+            t1.c.embedding,
+            oracle_vector=VectorIndexConfig(
+                index_type=VectorIndexType.IVF,
+                distance=VectorDistanceType.DOT,
+                accuracy=90,
+                ivf_neighbor_partitions=5,
+            ),
+        )
+        ivf_index.create(connection)
+
+        connection.execute(t1.insert(), dict(id=1, embedding=[6, 7, 8]))
+        eq_(
+            connection.execute(t1.select()).first(),
+            (1, [6.0, 7.0, 8.0]),
+        )
+
+    @testing.requires.oracle_vector
+    def test_vector_l2_distance(self, metadata, connection):
+        t1 = Table(
+            "t1",
+            metadata,
+            Column("id", Integer),
+            Column(
+                "embedding",
+                VECTOR(dim=3, storage_format=VectorStorageFormat.INT8),
+            ),
+        )
+
+        t1.create(connection)
+
+        connection.execute(t1.insert(), dict(id=1, embedding=[8, 9, 10]))
+        connection.execute(t1.insert(), dict(id=2, embedding=[1, 2, 3]))
+        connection.execute(
+            t1.insert(),
+            dict(id=3, embedding=[15, 16, 17]),
+        )
+
+        query_vector = [2, 3, 4]
+        res = connection.execute(
+            t1.select().order_by((t1.c.embedding.l2_distance(query_vector)))
+        ).first()
+        eq_(res.embedding, [1, 2, 3])
+
+    @testing.requires.oracle_sparse_vector
+    def test_sparse_vector(self, metadata, connection):
+        t1 = Table(
+            "t1",
+            metadata,
+            Column("id", Integer),
+            Column(
+                "embedding",
+                VECTOR(
+                    dim=3,
+                    storage_format=VectorStorageFormat.INT8,
+                    storage_type=VectorStorageType.SPARSE,
+                ),
+            ),
+        )
+        t1.create(connection)
+        eq_(t1.c.embedding.type.storage_type, VectorStorageType.SPARSE)
+
+    @testing.requires.oracle_sparse_vector
+    def test_sparse_vector_insert(self, metadata, connection):
+        t1 = Table(
+            "t1",
+            metadata,
+            Column("id", Integer),
+            Column(
+                "embedding",
+                VECTOR(
+                    dim=10,
+                    storage_format=VectorStorageFormat.FLOAT32,
+                    storage_type=VectorStorageType.SPARSE,
+                ),
+            ),
+        )
+        t1.create(connection)
+        sparse_vector = SparseVector(
+            10, [1, 2], array.array("f", [23.25, 221.625])
+        )
+        connection.execute(t1.insert(), dict(id=1, embedding=sparse_vector))
+        result = connection.execute(t1.select()).first()
+        eq_(result[0], 1)
+        eq_(isinstance(result[1], SparseVector), True)
+        eq_(result[1].num_dimensions, 10)
+        eq_(result[1].indices, array.array("I", [1, 2]))
+        eq_(result[1].values, array.array("f", [23.25, 221.625]))
+
+    @testing.only_on("oracle>=23.0")
+    def test_boolean_native(self, metadata, connection):
+        """Test native BOOLEAN type on Oracle 23c+"""
+        t = Table(
+            "boolean_test",
+            metadata,
+            Column("id", Integer, primary_key=True),
+            Column("x", sqltypes.Boolean),
+            Column("y", oracle.BOOLEAN),
+            Column(
+                "z", sqltypes.Boolean().with_variant(oracle.BOOLEAN, "oracle")
+            ),
+        )
+        t.create(connection)
+
+        # Insert test data
+        connection.execute(
+            t.insert(),
+            [
+                dict(id=1, x=True, y=True, z=True),
+                dict(id=2, x=False, y=False, z=False),
+                dict(id=3, x=None, y=None, z=None),
+            ],
+        )
+
+        # Test SELECT
+        rows = connection.execute(t.select().order_by(t.c.id)).fetchall()
+
+        for row, expected in zip(
+            rows,
+            [
+                (1, True, True, True),
+                (2, False, False, False),
+                (3, None, None, None),
+            ],
+        ):
+            for rval, expval in zip(row, expected):
+                # use is_() to ensure boolean type
+                is_(rval, expval)
+
+        # Test WHERE clause with boolean
+        result = connection.execute(t.select().where(t.c.x == True)).fetchall()
+        eq_(len(result), 1)
+        eq_(result[0][0], 1)
+
+        result = connection.execute(
+            t.select().where(t.c.x == False)
+        ).fetchall()
+        eq_(len(result), 1)
+        eq_(result[0][0], 2)
+
+    def test_boolean_emulated(self, metadata, testing_engine):
+        """Test emulated BOOLEAN type behavior
+
+        This test forces emulated mode by setting
+        supports_native_boolean=False, even on Oracle 23c+. This verifies
+        that the emulation layer still works correctly when native BOOLEAN
+        is available but not used.
+
+        Note: We only test sqltypes.Boolean here, not oracle.BOOLEAN or
+        with_variant(), because those explicitly request native BOOLEAN type
+        regardless of the supports_native_boolean setting.
+        """
+
+        e = testing_engine()
+
+        with e.connect() as connection:
+            e.dialect.supports_native_boolean = False
+
+            t = Table(
+                "boolean_emulated_test",
+                metadata,
+                Column("id", Integer, primary_key=True),
+                Column("data", sqltypes.Boolean),
+            )
+            t.create(connection)
+
+            # Insert test data
+            connection.execute(
+                t.insert(),
+                [
+                    dict(id=1, data=True),
+                    dict(id=2, data=False),
+                    dict(id=3, data=None),
+                ],
+            )
+
+            # Test SELECT - emulated boolean returns True/False
+            rows = connection.execute(t.select().order_by(t.c.id)).fetchall()
+
+            for row, expected in zip(
+                rows,
+                [
+                    (1, True, True, True),
+                    (2, False, False, False),
+                    (3, None, None, None),
+                ],
+            ):
+                for rval, expval in zip(row, expected):
+                    # use is_() to ensure boolean type
+                    is_(rval, expval)
+
+            # Test WHERE clause with boolean
+            result = connection.execute(
+                t.select().where(t.c.data == True)
+            ).fetchall()
+            eq_(len(result), 1)
+            eq_(result[0][0], 1)
+
+            result = connection.execute(
+                t.select().where(t.c.data == False)
+            ).fetchall()
+            eq_(len(result), 1)
+            eq_(result[0][0], 2)
+
+    @testing.only_on("oracle>=23.0")
+    def test_boolean_upgrade(self, metadata, connection):
+        """test that a table that has SMALLINT from a prior SQLAlchemy
+        version or older oracle version still works when native boolean is
+        flipped on for it.
+
+        """
+        t = Table(
+            "boolean_test",
+            metadata,
+            Column("id", Integer, primary_key=True),
+            Column("x", sqltypes.SMALLINT),
+        )
+        t.create(connection)
+
+        # Insert test data
+        connection.execute(
+            t.insert(),
+            [
+                dict(id=1, x=1),
+                dict(id=2, x=0),
+            ],
+        )
+
+        # now let's say we upgraded to oracle 23c and have the new
+        # SQLAlchemy
+
+        tt = Table(
+            "boolean_test",
+            MetaData(),
+            Column("id", Integer, primary_key=True),
+            Column("x", sqltypes.Boolean),
+        )
+
+        returning_result = connection.execute(
+            tt.insert().returning(tt.c.id, tt.c.x),
+            [
+                dict(id=3, x=True),
+                dict(id=4, x=False),
+            ],
+        )
+        rr = returning_result.all()
+
+        for row, expected in zip(rr, [(3, True), (4, False)]):
+            for rval, expval in zip(row, expected):
+                # use is_() to ensure boolean type
+                is_(rval, expval)
+
+        rows = connection.execute(tt.select().order_by(tt.c.id)).fetchall()
+        for row, expected in zip(
+            rows, [(1, True), (2, False), (3, True), (4, False)]
+        ):
+            for rval, expval in zip(row, expected):
+                # use is_() to ensure boolean type
+                is_(rval, expval)
+
+
+class LOBFetchTest(fixtures.TablesTest):
+    __only_on__ = "oracle"
+    __backend__ = True
+
+    run_inserts = "once"
+    run_deletes = None
+
+    @classmethod
+    def define_tables(cls, metadata):
+        Table(
+            "z_test",
+            metadata,
+            Column("id", Integer, primary_key=True),
+            Column("data", Text),
+            Column("bindata", LargeBinary),
+        )
+
+        Table(
+            "binary_table",
+            metadata,
+            Column("id", Integer, primary_key=True),
+            Column("data", LargeBinary),
+        )
+
+    @classmethod
+    def insert_data(cls, connection):
+        cls.data = data = [
+            dict(
+                id=i,
+                data="this is text %d" % i,
+                bindata=b("this is binary %d" % i),
+            )
+            for i in range(1, 20)
+        ]
+
+        connection.execute(cls.tables.z_test.insert(), data)
+
+        binary_table = cls.tables.binary_table
+        fname = os.path.join(
+            os.path.dirname(__file__), "..", "..", "binary_data_one.dat"
+        )
+        with open(fname, "rb") as file_:
+            cls.stream = stream = file_.read(12000)
+
+        for i in range(1, 11):
+            connection.execute(binary_table.insert(), dict(id=i, data=stream))
+
+    def _read_lob(self, engine, row):
+        if engine.dialect.is_async:
+            data = await_(row._mapping["data"].read())
+            bindata = await_(row._mapping["bindata"].read())
+        else:
+            data = row._mapping["data"].read()
+            bindata = row._mapping["bindata"].read()
+        return data, bindata
+
+    def test_lobs_without_convert(self):
+        engine = testing_engine(options=dict(auto_convert_lobs=False))
+        t = self.tables.z_test
+        with engine.begin() as conn:
+            row = conn.execute(t.select().where(t.c.id == 1)).first()
+            data, bindata = self._read_lob(engine, row)
+            eq_(data, "this is text 1")
+            eq_(bindata, b("this is binary 1"))
+
+    def test_lobs_with_convert(self, connection):
+        t = self.tables.z_test
+        row = connection.execute(t.select().where(t.c.id == 1)).first()
+        eq_(row._mapping["data"], "this is text 1")
+        eq_(row._mapping["bindata"], b("this is binary 1"))
+
+    def test_lobs_with_convert_raw(self, connection):
+        row = exec_sql(connection, "select data, bindata from z_test").first()
+        eq_(row._mapping["data"], "this is text 1")
+        eq_(row._mapping["bindata"], b("this is binary 1"))
+
+    def test_lobs_without_convert_many_rows(self):
+        engine = testing_engine(
+            options=dict(auto_convert_lobs=False, arraysize=1)
+        )
+        result = exec_sql(
+            engine.connect(),
+            "select id, data, bindata from z_test order by id",
+        )
+        results = result.fetchall()
+
+        def go():
+            actual = []
+            for row in results:
+                data, bindata = self._read_lob(engine, row)
+                actual.append(
+                    dict(id=row._mapping["id"], data=data, bindata=bindata)
+                )
+            eq_(actual, self.data)
+
+        go()
+
+    def test_lobs_with_convert_many_rows(self):
+        # even with low arraysize, lobs are fine in autoconvert
+        engine = testing_engine(
+            options=dict(auto_convert_lobs=True, arraysize=1)
+        )
+        with engine.connect() as conn:
+            result = exec_sql(
+                conn,
+                "select id, data, bindata from z_test order by id",
+            )
+            results = result.fetchall()
+
+            eq_(
+                [
+                    dict(
+                        id=row._mapping["id"],
+                        data=row._mapping["data"],
+                        bindata=row._mapping["bindata"],
+                    )
+                    for row in results
+                ],
+                self.data,
+            )
+
+    @testing.combinations(
+        (UnicodeText(),), (Text(),), (LargeBinary(),), argnames="datatype"
+    )
+    @testing.combinations((10,), (100,), (250,), argnames="datasize")
+    @testing.combinations(
+        ("x,y,z"), ("y"), ("y,x,z"), ("x,z,y"), argnames="retcols"
+    )
+    def test_insert_returning_w_lobs(
+        self, datatype, datasize, retcols, metadata, connection
+    ):
+        long_text = Table(
+            "long_text",
+            metadata,
+            Column("x", Integer),
+            Column("y", datatype),
+            Column("z", Integer),
+        )
+        long_text.create(connection)
+
+        if isinstance(datatype, UnicodeText):
+            word_seed = "ab🐍’«cdefg"
+        else:
+            word_seed = "abcdef"
+
+        some_text = " ".join(
+            "".join(random.choice(word_seed) for j in range(150))
+            for i in range(datasize)
+        )
+        if isinstance(datatype, LargeBinary):
+            some_text = some_text.encode("ascii")
+
+        data = {"x": 5, "y": some_text, "z": 10}
+        return_columns = [long_text.c[col] for col in retcols.split(",")]
+        expected = tuple(data[col] for col in retcols.split(","))
+        result = connection.execute(
+            long_text.insert().returning(*return_columns),
+            data,
+        )
+
+        eq_(result.fetchall(), [expected])
+
+    def test_insert_returning_w_unicode(self, metadata, connection):
+        long_text = Table(
+            "long_text",
+            metadata,
+            Column("x", Integer),
+            Column("y", Unicode(255)),
+        )
+        long_text.create(connection)
+
+        word_seed = "ab🐍’«cdefg"
+
+        some_text = " ".join(
+            "".join(random.choice(word_seed) for j in range(10))
+            for i in range(15)
+        )
+
+        data = {"x": 5, "y": some_text}
+        result = connection.execute(
+            long_text.insert().returning(long_text.c.y),
+            data,
+        )
+
+        eq_(result.fetchall(), [(some_text,)])
+
+    def test_large_stream(self, connection):
+        binary_table = self.tables.binary_table
+        result = connection.execute(
+            binary_table.select().order_by(binary_table.c.id)
+        ).fetchall()
+        eq_(result, [(i, self.stream) for i in range(1, 11)])
+
+    def test_large_stream_single_arraysize(self):
+        binary_table = self.tables.binary_table
+        eng = testing_engine(options={"arraysize": 1})
+        with eng.connect() as conn:
+            result = conn.execute(
+                binary_table.select().order_by(binary_table.c.id)
+            ).fetchall()
+            eq_(result, [(i, self.stream) for i in range(1, 11)])
+
+
+class EuroNumericTest(fixtures.TestBase):
+    """
+    test the numeric output_type_handler when using non-US locale for NLS_LANG.
+    """
+
+    __only_on__ = ("oracle+cx_oracle", "oracle+oracledb")
+    __backend__ = True
+
+    def setup_test(self):
+        connect = testing.db.pool._creator
+
+        def _creator():
+            conn = connect()
+            cursor = conn.cursor()
+            cursor.execute("ALTER SESSION SET NLS_TERRITORY='GERMANY'")
+            cursor.close()
+            return conn
+
+        self.engine = testing_engine(options={"creator": _creator})
+
+    def teardown_test(self):
+        self.engine.dispose()
+
+    def test_detection(self):
+        # revised as of #8744
+        with self.engine.connect() as conn:
+            connection = conn.connection
+
+            with connection.cursor() as cursor:
+                cx_Oracle = self.engine.dialect.dbapi
+
+                def output_type_handler(
+                    cursor, name, defaultType, size, precision, scale
+                ):
+                    return cursor.var(
+                        cx_Oracle.STRING, 255, arraysize=cursor.arraysize
+                    )
+
+                cursor.outputtypehandler = output_type_handler
+                cursor.execute("SELECT 1.1 FROM DUAL")
+                row = cursor.fetchone()
+                decimal_char = row[0][1]
+
+                if testing.against("+cx_oracle"):
+                    eq_(decimal_char, ",")
+                else:
+                    assert decimal_char in ",."
+
+                eq_(conn.dialect._decimal_char, decimal_char)
+
+    @testing.combinations(
+        ("SELECT 0.1 FROM DUAL", decimal.Decimal("0.1"), {}),
+        ("SELECT CAST(15 AS INTEGER) FROM DUAL", 15, {}),
+        (
+            "SELECT CAST(15 AS NUMERIC(3, 1)) FROM DUAL",
+            decimal.Decimal("15"),
+            {},
+        ),
+        (
+            "SELECT CAST(0.1 AS NUMERIC(5, 2)) FROM DUAL",
+            decimal.Decimal("0.1"),
+            {},
+        ),
+        (
+            "SELECT :num FROM DUAL",
+            decimal.Decimal("2.5"),
+            {"num": decimal.Decimal("2.5")},
+        ),
+        (
+            text(
+                "SELECT CAST(28.532 AS NUMERIC(5, 3)) " "AS val FROM DUAL"
+            ).columns(val=Numeric(5, 3, asdecimal=True)),
+            decimal.Decimal("28.532"),
+            {},
+        ),
+    )
+    def test_output_type_handler(self, stmt, expected, kw):
+        with self.engine.connect() as conn:
+            if isinstance(stmt, str):
+                test_exp = conn.exec_driver_sql(stmt, kw).scalar()
+            else:
+                test_exp = conn.scalar(stmt, **kw)
+            eq_(test_exp, expected)
+            assert type(test_exp) is type(expected)
+
+
+class SetInputSizesTest(fixtures.TestBase):
+    __only_on__ = ("oracle+cx_oracle", "oracle+oracledb")
+    __backend__ = True
+
+    @testing.combinations(
+        (SmallInteger, 25, int, False),
+        (Integer, 25, int, False),
+        (Numeric(10, 8), decimal.Decimal("25.34534"), None, False),
+        (oracle.FLOAT(15), 25.34534, None, False),
+        (oracle.BINARY_DOUBLE, 25.34534, "NATIVE_FLOAT", False),
+        (oracle.BINARY_FLOAT, 25.34534, "NATIVE_FLOAT", False),
+        (oracle.DOUBLE_PRECISION, 25.34534, None, False),
+        (Unicode(30), "test", "NCHAR", True),
+        (UnicodeText(), "test", "DB_TYPE_NVARCHAR", True),
+        (Unicode(30), "test", None, False),
+        (UnicodeText(), "test", "DB_TYPE_NVARCHAR", False),
+        (String(30), "test", None, False),
+        (CHAR(30), "test", "FIXED_CHAR", False),
+        (NCHAR(30), "test", "FIXED_NCHAR", False),
+        (oracle.LONG(), "test", None, False),
+        argnames="datatype, value, sis_value_text, set_nchar_flag",
+    )
+    def test_setinputsizes(
+        self, metadata, datatype, value, sis_value_text, set_nchar_flag
+    ):
+        if isinstance(sis_value_text, str):
+            sis_value = getattr(testing.db.dialect.dbapi, sis_value_text)
+        else:
+            sis_value = sis_value_text
+
+        class TestTypeDec(TypeDecorator):
+            impl = NullType()
+            cache_ok = True
+
+            def load_dialect_impl(self, dialect):
+                if dialect.name == "oracle":
+                    return dialect.type_descriptor(datatype)
+                else:
+                    return self.impl
+
+        m = metadata
+        # Oracle can have only one column of type LONG so we make three
+        # tables rather than one table w/ three columns
+        t1 = Table("t1", m, Column("foo", datatype))
+        t2 = Table(
+            "t2", m, Column("foo", NullType().with_variant(datatype, "oracle"))
+        )
+        t3 = Table("t3", m, Column("foo", TestTypeDec()))
+
+        class CursorWrapper:
+            # cx_oracle cursor can't be modified so we have to
+            # invent a whole wrapping scheme
+
+            def __init__(self, connection_fairy):
+                self.cursor = connection_fairy.dbapi_connection.cursor()
+                self.mock = mock.Mock()
+                connection_fairy.info["mock"] = self.mock
+
+            def setinputsizes(self, *arg, **kw):
+                self.mock.setinputsizes(*arg, **kw)
+                self.cursor.setinputsizes(*arg, **kw)
+
+            def __getattr__(self, key):
+                return getattr(self.cursor, key)
+
+        if set_nchar_flag:
+            engine = testing_engine(options={"use_nchar_for_unicode": True})
+        else:
+            engine = testing.db
+
+        with engine.connect() as conn:
+            conn.begin()
+
+            m.create_all(conn, checkfirst=False)
+
+            connection_fairy = conn.connection
+            for tab in [t1, t2, t3]:
+                with mock.patch.object(
+                    connection_fairy,
+                    "cursor",
+                    lambda: CursorWrapper(connection_fairy),
+                ):
+                    conn.execute(tab.insert(), {"foo": value})
+
+                if sis_value:
+                    eq_(
+                        conn.info["mock"].mock_calls,
+                        [mock.call.setinputsizes(foo=sis_value)],
+                    )
+                else:
+                    eq_(
+                        conn.info["mock"].mock_calls,
+                        [mock.call.setinputsizes()],
+                    )
+
+    def test_event_no_native_float(self, metadata):
+        def _remove_type(inputsizes, cursor, statement, parameters, context):
+            for param, dbapitype in list(inputsizes.items()):
+                if dbapitype is testing.db.dialect.dbapi.NATIVE_FLOAT:
+                    del inputsizes[param]
+
+        event.listen(testing.db, "do_setinputsizes", _remove_type)
+        try:
+            self.test_setinputsizes(
+                metadata, oracle.BINARY_FLOAT, 25.34534, None, False
+            )
+        finally:
+            event.remove(testing.db, "do_setinputsizes", _remove_type)
+
+
+class JSONTest(fixtures.TestBase):
+    __requires__ = ("json_type",)
+    __only_on__ = "oracle"
+    __backend__ = True
+
+    @testing.requires.reflects_json_type
+    def test_reflection(self, metadata, connection):
+        Table("oracle_json", metadata, Column("foo", oracle.JSON))
+        metadata.create_all(connection)
+
+        reflected = Table("oracle_json", MetaData(), autoload_with=connection)
+        is_(reflected.c.foo.type._type_affinity, sqltypes.JSON)
+        assert isinstance(reflected.c.foo.type, oracle.JSON)
+
+    def test_rudimentary_round_trip(self, metadata, connection):
+        oracle_json = Table(
+            "oracle_json", metadata, Column("foo", oracle.JSON)
+        )
+        metadata.create_all(connection)
+
+        value = {"json": {"foo": "bar"}, "recs": ["one", "two"]}
+
+        connection.execute(oracle_json.insert(), dict(foo=value))
+
+        eq_(connection.scalar(select(oracle_json.c.foo)), value)
+
+    def test_extract_subobject(self, connection, metadata):
+        oracle_json = Table(
+            "oracle_json", metadata, Column("foo", oracle.JSON)
+        )
+        metadata.create_all(connection)
+
+        value = {"json": {"foo": "bar"}}
+        connection.execute(oracle_json.insert(), dict(foo=value))
+
+        eq_(
+            connection.scalar(select(oracle_json.c.foo["json"])),
+            value["json"],
+        )
+
+
+class JSONBlobSuiteTest(suite.JSONTest):
+    __only_on__ = "oracle+oracledb"
+
+    datatype = functools.partial(oracle.JSON, use_blob=True)
+
+
+class TextualSelectTypeHandlerTest(fixtures.TablesTest):
+    """test that per-cursor outputtypehandlers are established for
+    textual constructs that carry positional column information, such as
+    :func:`_sql.text` / :func:`_sql.tstring` with ``.columns()``.
+
+    For these constructs the names reported by ``cursor.description`` are
+    generated by the database and don't correspond to the names given to
+    ``.columns()``, so the handlers have to be matched positionally.
+
+    See #13479
+
+    """
+
+    __only_on__ = "oracle"
+    __backend__ = True
+
+    @classmethod
+    def define_tables(cls, metadata):
+        Table(
+            "data_table",
+            metadata,
+            Column("id", Integer, primary_key=True),
+            Column("data", sqltypes.JSON, nullable=True),
+        )
+
+    @testing.requires.json_type
+    def test_json_bound_literal(self, connection):
+        """the JSON value arrives as a plain string bound parameter, with
+        no JSON column involved at all"""
+
+        value = {"json": {"foo": "bar"}, "recs": ["one", "two"]}
+
+        stmt = text("select :p from dual").columns(column("jj", sqltypes.JSON))
+        eq_(connection.scalar(stmt, {"p": json.dumps(value)}), value)
+
+    @testing.requires.json_type
+    def test_json_column(self, connection):
+        value = {"json": {"foo": "bar"}}
+        connection.execute(
+            self.tables.data_table.insert(), {"id": 1, "data": value}
+        )
+
+        stmt = text("select data from data_table").columns(
+            column("jj", sqltypes.JSON)
+        )
+        eq_(connection.scalar(stmt), value)
+
+    @testing.requires.json_type
+    def test_json_null_value(self, connection):
+        connection.execute(
+            self.tables.data_table.insert(), {"id": 1, "data": None}
+        )
+
+        stmt = text("select data from data_table").columns(
+            column("jj", sqltypes.JSON)
+        )
+        eq_(connection.scalar(stmt), None)
+
+    @testing.requires.json_type
+    def test_json_clob_expression(self, connection):
+        """a JSON expression that the database reports as a LOB"""
+
+        value = {"json": {"foo": "bar"}, "recs": ["one", "two"]}
+
+        stmt = text("select to_clob(:p) from dual").columns(
+            column("jj", sqltypes.JSON)
+        )
+        eq_(connection.scalar(stmt, {"p": json.dumps(value)}), value)
+
+    def test_json_blob_bound_literal(self, connection):
+        value = {"json": {"foo": "bar"}}
+
+        stmt = text("select :p from dual").columns(
+            column("jj", oracle.JSON(use_blob=True))
+        )
+        eq_(connection.scalar(stmt, {"p": json.dumps(value)}), value)
+
+    @testing.requires.json_type
+    def test_positional_alignment_mixed_types(self, connection):
+        """handlers have to line up with the cursor's columns positionally,
+        including for columns that have no handler of their own"""
+
+        value = {"json": {"foo": "bar"}}
+
+        stmt = text("select 'x', :p, 1, 2.5, 'y' from dual").columns(
+            column("a", String),
+            column("jj", sqltypes.JSON),
+            column("i", Integer),
+            column("n", Numeric(asdecimal=True)),
+            column("b", String),
+        )
+        eq_(
+            connection.execute(stmt, {"p": json.dumps(value)}).all(),
+            [("x", value, 1, decimal.Decimal("2.5"), "y")],
+        )
+
+    def test_numeric_positional(self, connection):
+        """Numeric is normally handled by the connection-level handler;
+        assert the cursor-level handler doesn't misalign it"""
+
+        stmt = text("select 1.5, 2.5 from dual").columns(
+            column("a", Numeric(asdecimal=False)),
+            column("b", Numeric(asdecimal=True)),
+        )
+        eq_(connection.execute(stmt).all(), [(1.5, decimal.Decimal("2.5"))])
+
+    @testing.requires.json_type
+    def test_compiled_select_still_matches_by_name(self, connection):
+        """the non-textual case continues to match handlers by the
+        rendered column name"""
+
+        value = {"json": {"foo": "bar"}}
+        eq_(
+            connection.scalar(select(literal(value, sqltypes.JSON))),
+            value,
+        )
+
+
+class JSONDeserializerTest(fixtures.TablesTest):
+    """test that a custom ``json_deserializer`` is honored by each of the
+    branches of the JSON outputtypehandler.
+
+    """
+
+    __only_on__ = "oracle"
+    __backend__ = True
+    __requires__ = ("json_type",)
+
+    @classmethod
+    def define_tables(cls, metadata):
+        Table(
+            "json_deser_data",
+            metadata,
+            Column("id", Integer, primary_key=True),
+            Column("data", sqltypes.JSON),
+        )
+
+    @testing.fixture
+    def json_connection(self, testing_engine):
+        def loads(value):
+            return ("deserialized", json.loads(value))
+
+        engine = testing_engine(options={"json_deserializer": loads})
+        with engine.connect() as conn:
+            yield conn
+
+    def test_native_json_column(self, json_connection):
+        """a native JSON column, which the driver would otherwise decode
+        on its own"""
+
+        value = {"json": {"foo": "bar"}}
+        json_connection.execute(
+            self.tables.json_deser_data.insert(), {"id": 1, "data": value}
+        )
+
+        eq_(
+            json_connection.scalar(select(self.tables.json_deser_data.c.data)),
+            ("deserialized", value),
+        )
+
+    def test_character_expression(self, json_connection):
+        value = {"json": {"foo": "bar"}}
+
+        stmt = text("select :p from dual").columns(column("jj", sqltypes.JSON))
+        eq_(
+            json_connection.scalar(stmt, {"p": json.dumps(value)}),
+            ("deserialized", value),
+        )
+
+    def test_lob_expression(self, json_connection):
+        value = {"json": {"foo": "bar"}}
+
+        stmt = text("select to_clob(:p) from dual").columns(
+            column("jj", sqltypes.JSON)
+        )
+        eq_(
+            json_connection.scalar(stmt, {"p": json.dumps(value)}),
+            ("deserialized", value),
+        )

@@ -1,0 +1,38 @@
+from typing import Any
+from typing import assert_type
+
+from sqlalchemy import column
+from sqlalchemy import ColumnElement
+from sqlalchemy import Integer
+from sqlalchemy import literal
+from sqlalchemy import table
+from sqlalchemy.sql.expression import ColumnClause
+
+
+def test_col_accessors() -> None:
+    t = table("t", column("a"), column("b"), column("c"))
+
+    t.c.a
+    t.c["a"]
+
+    t.c[2]
+    t.c[0, 1]
+    t.c[0, 1, "b", "c"]
+    t.c[(0, 1, "b", "c")]
+
+    t.c[:-1]
+    t.c[0:2]
+
+
+def test_col_get() -> None:
+    col_id = column("id", Integer)
+    col_alt = column("alt", Integer)
+    tbl = table("mytable", col_id)
+
+    assert_type(tbl.c.get("id"), ColumnClause[Any] | None)
+    assert_type(tbl.c.get("id", None), ColumnClause[Any] | None)
+    assert_type(
+        tbl.c.get("alt", col_alt), ColumnClause[Any] | ColumnClause[int]
+    )
+    col: ColumnElement[Any] = tbl.c.get("foo", literal("bar"))
+    print(col)
