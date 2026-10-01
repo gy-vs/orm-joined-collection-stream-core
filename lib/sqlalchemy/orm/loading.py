@@ -77,6 +77,212 @@ _new_runid = util.counter()
 _PopulatorDict = Dict[str, List[Tuple[str, Any]]]
 
 
+class _JoinedCollectionStream:
+    """Stream rows produced by a joined eager load against a collection
+    while using ``yield_per``.
+
+    A joined collection eager load repeats the lead (parent) object on every
+    row that corresponds to a related (child) object.  When rows are
+    consumed in database-side batches, a lead object may only be partially
+    represented within a given batch.  This buffer holds back the rows of
+    the trailing lead object in each batch until rows from the next batch
+    confirm that no further rows remain for it, ensuring a lead object is
+    only ever returned once its eagerly loaded collection is complete.
+
+    Correct delivery requires that rows for each lead object are
+    contiguous in the result, e.g. the statement orders by lead object
+    identity.  Non-contiguous lead objects are detected and an
+    :class:`.InvalidRequestError` is raised, as there is no way to return
+    complete collections without buffering the full result.
+
+    """
+
+    __slots__ = (
+        "single_entity",
+        "process",
+        "unique_filters",
+        "seen_keys",
+        "seen_tokens",
+        "seen_null",
+        "pending",
+        "pending_token",
+        "pending_null",
+    )
+
+    def __init__(self, single_entity, process, unique_filters):
+        self.single_entity = single_entity
+        self.process = process
+        self.unique_filters = unique_filters
+        self.seen_keys = set()
+        # identity tokens of delivered lead groups, kept alive so that an
+        # id()-based token (mapper entities are uniqued by id()) cannot be
+        # reused by Python for an unrelated garbage-collected object
+        self.seen_tokens = []
+        self.seen_null = False
+        # the held-back first row of the trailing group
+        self.pending = None
+        self.pending_token = None
+        self.pending_null = False
+
+    def _identity_components(self, row):
+        # return (objects, values): mapped entities contributing object
+        # identity, raw columns contributing hashable values
+        if self.single_entity:
+            # the lead entity is None for outer-join rows without a lead
+            # object; represent those as value-based identity
+            if row is None:
+                entities = ()
+                values = (None,)
+            else:
+                entities = (row,)
+                values = ()
+        else:
+            entities, values = [], []
+            for flt, value in zip(self.unique_filters, row):
+                if flt is id:
+                    if value is None:
+                        values.append(None)
+                    else:
+                        entities.append(value)
+                else:
+                    values.append(value)
+        return tuple(entities), tuple(values)
+
+    def _is_null_lead(self, row):
+        # rows with no lead entity (e.g. outer join rows) are globally
+        # deduplicated rather than treated as interleaved lead objects.
+        if self.single_entity:
+            return row is None
+        else:
+            return row[0] is None
+
+    def _token(self, refs, values):
+        return values, tuple(map(id, refs))
+
+    @staticmethod
+    def _same_identity(refs, values, other_refs, other_values):
+        # object identity for mapped entities, value equality for raw
+        # columns
+        if values != other_values or len(refs) != len(other_refs):
+            return False
+        return all(a is b for a, b in zip(refs, other_refs))
+
+    def process_rows(self, fetch):
+        """Process one database-side batch of raw rows.
+
+        All rows are converted to mapped instances so that eager object
+        population takes place, including for the held-back lead object.
+        Only the first row of each completed lead-object group is returned,
+        once the group is known to be complete.
+
+        """
+        if self.single_entity:
+            proc = self.process[0]
+            processed = [proc(row) for row in fetch]
+        else:
+            process = self.process
+            processed = [
+                tuple(proc(row) for proc in process) for row in fetch
+            ]
+
+        out = []
+
+        if self.pending is None:
+            group_refs = ()
+            group_values = None
+            group_first = None
+            group_null = False
+            group_has_begun = False
+        else:
+            # continue the held-back group from the previous batch
+            group_refs = self.pending_token[0]
+            group_values = self.pending_token[1]
+            group_first = self.pending
+            group_null = self.pending_null
+            group_has_begun = True
+
+        for row in processed:
+            refs, values = self._identity_components(row)
+            null = self._is_null_lead(row)
+
+            if not group_has_begun:
+                if not null and self._token(refs, values) in self.seen_keys:
+                    self._raise_non_contiguous()
+                group_refs, group_values = refs, values
+                group_first = row
+                group_null = null
+                group_has_begun = True
+            elif (
+                null != group_null
+                or (
+                    not null
+                    and not self._same_identity(
+                        refs, values, group_refs, group_values
+                    )
+                )
+            ):
+                # the previous group is now complete.
+                # null-lead rows (outer join rows without a lead object) are
+                # deduplicated globally, as a "unique" filter would.
+                if group_null:
+                    if not self.seen_null:
+                        self.seen_null = True
+                        out.append(group_first)
+                else:
+                    self.seen_keys.add(
+                        self._token(group_refs, group_values)
+                    )
+                    # keep the mapped entities alive for the duration of the
+                    # stream; mapper entities are uniqued by id(), whose
+                    # integer value may otherwise be reused by Python for an
+                    # unrelated object after garbage collection
+                    self.seen_tokens.append(group_refs)
+                    out.append(group_first)
+
+                # begin a new group
+                if not null and self._token(refs, values) in self.seen_keys:
+                    self._raise_non_contiguous()
+                group_refs, group_values = refs, values
+                group_first = row
+                group_null = null
+
+        # hold back the trailing group until the next batch confirms it.
+        # group_refs retains the lead objects and prevents their identity
+        # from being reused between batches.
+        if group_has_begun:
+            self.pending = group_first
+            self.pending_token = (group_refs, group_values)
+            self.pending_null = group_null
+        else:
+            self.pending = None
+            self.pending_token = None
+            self.pending_null = False
+
+        return out
+
+    def _raise_non_contiguous(self):
+        raise sa_exc.InvalidRequestError(
+            "Can't use yield_per with joined eager loads against "
+            "collections when the lead objects of the result are "
+            "not grouped contiguously by identity.  Ensure the "
+            "statement is ordered by the lead object's primary "
+            "key (e.g. using Query.order_by()), so that all rows "
+            "for each lead object are delivered sequentially."
+        )
+
+    def release_pending(self):
+        """Return the held-back lead object now that the cursor is exhausted.
+
+        """
+        if self.pending is None:
+            return []
+        row = self.pending
+        self.pending = None
+        self.pending_token = None
+        self.pending_null = False
+        return [row]
+
+
 def instances(
     cursor: CursorResult[Unpack[TupleAny]], context: QueryContext
 ) -> Result[Unpack[TupleAny]]:
@@ -121,17 +327,25 @@ def instances(
             )
         )
 
-        if context.yield_per and (
-            context.loaders_require_buffering
-            or context.loaders_require_uniquing
-        ):
+        if context.yield_per and context.loaders_require_buffering:
             raise sa_exc.InvalidRequestError(
-                "Can't use yield_per with eager loaders that require uniquing "
-                "or row buffering, e.g. joinedload() against collections "
-                "or subqueryload().  Consider the selectinload() strategy "
-                "for better flexibility in loading objects."
+                "Can't use yield_per with eager loaders that require row "
+                "buffering, e.g. subqueryload().  Consider the "
+                "selectinload() strategy for better flexibility in loading "
+                "objects."
             )
 
+        # joined eager loads against collections produce repeated rows for a
+        # single lead object.  When yield_per is in effect, we stream rows in
+        # chunks but hold back the trailing (possibly incomplete) group of
+        # rows in each chunk until the next chunk confirms the lead object
+        # is complete.  This only produces correct results if rows for each
+        # lead object are contiguous, i.e. ordered by the lead object's
+        # identity; non-contiguous ordering is detected and rejected while
+        # streaming.
+        stream_collection_joined = bool(
+            context.yield_per and context.loaders_require_uniquing
+        )
     except Exception:
         with util.safe_reraise():
             cursor.close()
@@ -179,18 +393,7 @@ def instances(
 
             return go
 
-    _uniquing_is_active = False
-
-    def _create_unique_filters(result):
-        nonlocal _uniquing_is_active
-
-        if result._yield_per:
-            raise sa_exc.InvalidRequestError(
-                "Can't use the ORM yield_per feature "
-                "in conjunction with unique()"
-            )
-
-        _uniquing_is_active = True
+    def _build_unique_filters():
         return [
             (
                 _not_hashable(
@@ -207,8 +410,37 @@ def instances(
             for ent in context.compile_state._entities
         ]
 
+    _uniquing_is_active = False
+
+    def _create_unique_filters(result):
+        nonlocal _uniquing_is_active
+
+        if result._yield_per and not stream_collection_joined:
+            raise sa_exc.InvalidRequestError(
+                "Can't use the ORM yield_per feature "
+                "in conjunction with unique()"
+            )
+
+        _uniquing_is_active = True
+        return _build_unique_filters()
+
     row_metadata = SimpleResultMetaData(
         labels, extra, _create_unique_filters=_create_unique_filters
+    )
+
+    # streaming state for joinedload against collections combined with
+    # yield_per.  because ChunkedIteratorResult may create a new ``chunks()``
+    # generator per fetch (i.e. when using a server side cursor), both the
+    # grouping state and the chunk generator must live outside of
+    # ``chunks()`` and be shared across calls.
+    stream_state: Optional[_JoinedCollectionStream] = (
+        _JoinedCollectionStream(
+            single_entity,
+            process,
+            _build_unique_filters(),
+        )
+        if stream_collection_joined
+        else None
     )
 
     def chunks(size):  # type: ignore
@@ -218,7 +450,7 @@ def instances(
             context.partials = {}
 
             if yield_per:
-                if _uniquing_is_active:
+                if _uniquing_is_active and stream_state is None:
                     raise sa_exc.InvalidRequestError(
                         "Can't use the ORM yield_per feature "
                         "in conjunction with unique()"
@@ -226,11 +458,26 @@ def instances(
                 fetch = cursor.fetchmany(yield_per)
 
                 if not fetch:
+                    if stream_state is not None:
+                        # the cursor is fully consumed; the held-back rows
+                        # now represent the final, complete lead object.
+                        # its post-load eager loaders were already invoked
+                        # when its rows were processed in the previous
+                        # batch.
+                        final_rows = stream_state.release_pending()
+                        if final_rows:
+                            yield final_rows
                     break
             else:
                 fetch = cursor._raw_all_tuples()
 
-            if single_entity:
+            if stream_state is not None:
+                try:
+                    rows = stream_state.process_rows(fetch)
+                except Exception:
+                    with util.safe_reraise():
+                        cursor.close()
+            elif single_entity:
                 proc = process[0]
                 rows = [proc(row) for row in fetch]
             else:
@@ -261,10 +508,51 @@ def instances(
                     context.post_load_paths.clear()
                     context.post_load_paths.update(top_level_post_loads)
 
-            yield rows
+            if stream_state is not None:
+                # a batch can produce zero completed lead objects when the
+                # whole batch is part of one still-open group
+                if rows:
+                    yield rows
+            else:
+                yield rows
 
             if not yield_per:
                 break
+
+    if stream_state is not None:
+        # always drive the cursor with the configured ORM yield_per batch
+        # size, even when the caller requests differently sized fetchmany()
+        # chunks (e.g. a server side cursor, where ChunkedIteratorResult
+        # creates a new chunks() generator per fetchmany()).  a single
+        # persistent iterator over completed lead groups is shared across
+        # those generators; each chunks() invocation pulls the next groups
+        # from it and repackages them to the requested output size.
+        _persistent_group_iter = iter(chunks(context.yield_per))
+        _stream_buffer: list = []
+
+        def _next_groups(size):
+            while len(_stream_buffer) < size:
+                try:
+                    _stream_buffer.extend(
+                        next(_persistent_group_iter)
+                    )
+                except StopIteration:
+                    break
+            res = _stream_buffer[:size]
+            del _stream_buffer[:size]
+            return res
+
+        def chunks(size):  # type: ignore
+            if not size:
+                for chunk in _persistent_group_iter:
+                    yield chunk
+                return
+
+            while True:
+                rows = _next_groups(size)
+                if not rows:
+                    break
+                yield rows
 
     if context.execution_options.get("prebuffer_rows", False):
         # this is a bit of a hack at the moment.
@@ -291,8 +579,10 @@ def instances(
         dict(filtered=filtered, is_single_entity=single_entity)
     )
 
-    # multi_row_eager_loaders OTOH is specific to joinedload.
-    if context.requires_uniquing:
+    # multi_row_eager_loaders OTOH is specific to joinedload.  when
+    # streaming joined collections with yield_per, rows are already
+    # uniqued by the loading process, so no unique() guard is installed.
+    if context.requires_uniquing and not stream_collection_joined:
 
         def require_unique(obj):
             raise sa_exc.InvalidRequestError(

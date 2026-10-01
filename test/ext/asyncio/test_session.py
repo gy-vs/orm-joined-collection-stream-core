@@ -25,6 +25,7 @@ from sqlalchemy.ext.asyncio import close_all_sessions
 from sqlalchemy.ext.asyncio import exc as async_exc
 from sqlalchemy.ext.asyncio.base import ReversibleProxy
 from sqlalchemy.orm import DeclarativeBase
+from sqlalchemy.orm import joinedload
 from sqlalchemy.orm import Mapped
 from sqlalchemy.orm import mapped_column
 from sqlalchemy.orm import relationship
@@ -518,6 +519,138 @@ class AsyncSessionQueryTest(AsyncFixture):
         elif filter_ == "stream_scalars":
             result = await (await async_session.stream_scalars(stmt)).all()
         eq_(result, self.static.user_address_result)
+
+    @async_test
+    @testing.combinations((1,), (2,), (5,), (50,), argnames="yield_per")
+    async def test_stream_joined_collection_yield_per(
+        self, async_session, yield_per
+    ):
+        User = self.classes.User
+
+        buffered = (
+            (
+                await async_session.execute(
+                    select(User)
+                    .options(joinedload(User.addresses))
+                    .order_by(User.id)
+                )
+            )
+            .unique()
+            .scalars()
+            .all()
+        )
+
+        stream = await async_session.stream(
+            select(User)
+            .options(joinedload(User.addresses))
+            .order_by(User.id)
+            .execution_options(yield_per=yield_per)
+        )
+
+        got = []
+        async for row in stream:
+            user = row[0]
+            got.append(
+                (user.id, [a.email_address for a in user.addresses])
+            )
+
+        eq_(
+            got,
+            [(u.id, [a.email_address for a in u.addresses]) for u in buffered],
+        )
+
+    @async_test
+    async def test_stream_joined_collection_yield_per_fetchmany(
+        self, async_session
+    ):
+        User = self.classes.User
+
+        buffered = (
+            (
+                await async_session.execute(
+                    select(User)
+                    .options(joinedload(User.addresses))
+                    .order_by(User.id)
+                )
+            )
+            .unique()
+            .scalars()
+            .all()
+        )
+
+        stream = await async_session.stream(
+            select(User)
+            .options(joinedload(User.addresses))
+            .order_by(User.id)
+            .execution_options(yield_per=2)
+        )
+
+        # use fetchmany with a size different from the yield_per batch size;
+        # the underlying server-side cursor is driven a chunk at a time and
+        # must still release the final held-back lead object
+        got = []
+        while True:
+            rows = await stream.fetchmany(3)
+            if not rows:
+                break
+            got.extend(
+                (
+                    user.id,
+                    [a.email_address for a in user.addresses],
+                )
+                for (user,) in rows
+            )
+
+        eq_(
+            got,
+            [
+                (u.id, [a.email_address for a in u.addresses])
+                for u in buffered
+            ],
+        )
+
+    @async_test
+    async def test_stream_joined_collection_yield_per_early_close(
+        self, async_session
+    ):
+        User = self.classes.User
+
+        buffered = {
+            u.id: [a.email_address for a in u.addresses]
+            for u in (
+                await async_session.execute(
+                    select(User)
+                    .options(joinedload(User.addresses))
+                    .order_by(User.id)
+                )
+            )
+            .unique()
+            .scalars()
+        }
+
+        stream = await async_session.stream(
+            select(User)
+            .options(joinedload(User.addresses))
+            .order_by(User.id)
+            .execution_options(yield_per=1)
+        )
+
+        seen = []
+        async for row in stream:
+            user = row[0]
+            # the collection must be complete at the moment the lead
+            # object is delivered, even though the child rows span the
+            # streaming batch boundary
+            eq_(
+                [a.email_address for a in user.addresses],
+                buffered[user.id],
+            )
+            seen.append(user.id)
+            if len(seen) == 2:
+                break
+
+        await stream.close()
+        eq_(seen, [7, 8])
 
     @async_test
     async def test_get(self, async_session):

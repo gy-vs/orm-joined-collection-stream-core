@@ -5610,34 +5610,50 @@ class YieldTest(_fixtures.FixtureTest):
         eq_(len(result.all()), 4)
 
     def test_no_joinedload_opt(self):
-        self._eagerload_mappings()
-
-        User = self.classes.User
-        sess = fixture_session()
-        q = sess.query(User).options(joinedload(User.addresses)).yield_per(1)
-        assert_raises_message(
-            sa_exc.InvalidRequestError,
-            "Can't use yield_per with eager loaders that require "
-            "uniquing or row buffering",
-            q.all,
-        )
-
-    def test_no_contains_eager_opt(self):
+        # joinedload() against collections is compatible with yield_per,
+        # streaming lead objects with complete collections.
         self._eagerload_mappings()
 
         User = self.classes.User
         sess = fixture_session()
         q = (
             sess.query(User)
+            .options(joinedload(User.addresses))
+            .yield_per(1)
+            .order_by(User.id)
+        )
+        eq_(
+            [
+                (u.id, sorted(a.email_address for a in u.addresses))
+                for u in q
+            ],
+            self._user_address_results(),
+        )
+
+    def test_no_contains_eager_opt(self):
+        # contains_eager() against collections is compatible with
+        # yield_per as well, provided lead object rows are contiguous.
+        self._eagerload_mappings()
+
+        User, Address = self.classes("User", "Address")
+        sess = fixture_session()
+        q = (
+            sess.query(User)
             .join(User.addresses)
             .options(contains_eager(User.addresses))
             .yield_per(1)
+            .order_by(User.id, Address.id)
         )
-        assert_raises_message(
-            sa_exc.InvalidRequestError,
-            "Can't use yield_per with eager loaders that require "
-            "uniquing or row buffering",
-            q.all,
+        eq_(
+            [
+                (u.id, sorted(a.email_address for a in u.addresses))
+                for u in q
+            ],
+            [
+                (uid, addrs)
+                for uid, addrs in self._user_address_results()
+                if addrs
+            ],
         )
 
     def test_no_subqueryload_opt(self):
@@ -5649,7 +5665,7 @@ class YieldTest(_fixtures.FixtureTest):
         assert_raises_message(
             sa_exc.InvalidRequestError,
             "Can't use yield_per with eager loaders that require "
-            "uniquing or row buffering",
+            "row buffering",
             q.all,
         )
 
@@ -5662,9 +5678,18 @@ class YieldTest(_fixtures.FixtureTest):
         assert_raises_message(
             sa_exc.InvalidRequestError,
             "Can't use yield_per with eager loaders that require "
-            "uniquing or row buffering",
+            "row buffering",
             q.all,
         )
+
+    @staticmethod
+    def _user_address_results():
+        return [
+            (7, ["jack@bean.com"]),
+            (8, ["ed@bettyboop.com", "ed@lala.com", "ed@wood.com"]),
+            (9, ["fred@fred.com"]),
+            (10, []),
+        ]
 
     def test_joinedload_m2o_ok(self):
         self._eagerload_mappings(user_lazy="joined")
