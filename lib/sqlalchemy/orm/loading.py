@@ -18,6 +18,7 @@ as well as some of the attribute loading strategies.
 from __future__ import annotations
 
 from typing import Any
+from typing import Callable
 from typing import Dict
 from typing import Iterable
 from typing import List
@@ -76,6 +77,228 @@ _new_runid = util.counter()
 
 _PopulatorDict = Dict[str, List[Tuple[str, Any]]]
 
+_NO_PENDING_ROW = util.symbol("NO_PENDING_ROW")
+
+
+def _invoke_top_level_post_loads(context: "QueryContext") -> None:
+    """Invoke all currently-collected top level "post load" operations.
+
+    This runs loaders such as selectinload()/immediateload() for the
+    objects that were just processed.  The post-load paths are preserved
+    afterwards so that they remain available for subsequent fetch batches.
+
+    """
+    top_level_post_loads = list(context.post_load_paths.items())
+    while context.post_load_paths:
+        post_loads = list(context.post_load_paths.items())
+        context.post_load_paths.clear()
+        for path, post_load in post_loads:
+            post_load.invoke(context, path)
+    context.post_load_paths.clear()
+    context.post_load_paths.update(top_level_post_loads)
+
+
+def _stream_collection_groups(
+    rows: Sequence[Any],
+    group_key_fn: Callable[[Any], Any],
+    pending_key: Any,
+    pending_row: Any,
+    seen_groups: set,
+) -> Tuple[List[Any], Any, Any]:
+    """Partition processed ORM rows into completed parent groups.
+
+    Rows from a collection joined eager load contain one row per parent /
+    child combination.  Under ``yield_per`` we may emit a parent object
+    only once all of its rows have been seen.  This requires the rows for
+    a given parent identity to be grouped contiguously in the result, as
+    is the case when ordering by parent primary key.
+
+    Only the first (representative) row of the in-progress group is
+    buffered; the eager child objects have already been attached to the
+    parent's collection while the rows were processed, so retaining the
+    remaining rows would only duplicate references.  When the group
+    closes the representative is appended to ``completed``.
+
+    If a parent identity reappears after its group was already completed
+    -- i.e. the rows are interleaved -- the parent could not be delivered
+    with a complete collection without full result buffering, so
+    :class:`.InvalidRequestError` is raised.
+
+    Returns ``(completed_rows, new_pending_key, new_pending_row)``.
+
+    """
+    completed: List[Any] = []
+
+    for row in rows:
+        key = group_key_fn(row)
+
+        if pending_key is None:
+            # starting a brand new parent group
+            pending_key = key
+            pending_row = row
+        elif key == pending_key:
+            # another row for the group currently being assembled; its
+            # objects are already populated onto the pending parent, so
+            # only the representative row is retained.
+            pass
+        else:
+            # a new parent identity is starting; the previous group is
+            # now complete
+            if pending_key in seen_groups:
+                raise sa_exc.InvalidRequestError(
+                    "Can't use yield_per with joined eager loads against "
+                    "collections when the rows for a parent identity are "
+                    "not grouped contiguously; the query must ORDER BY the "
+                    "parent primary key (or otherwise guarantee that all "
+                    "rows for each parent are returned consecutively) so "
+                    "that parent objects can be streamed with complete "
+                    "collections."
+                )
+            seen_groups.add(pending_key)
+            completed.append(pending_row)
+
+            pending_key = key
+            pending_row = row
+
+    return completed, pending_key, pending_row
+
+
+class _CollectionYieldPerChunker:
+    """Stateful streaming chunker for collection joined eager loads.
+
+    Wraps the raw cursor for a query that uses collection
+    :func:`_orm.joinedload` together with ``yield_per``.  The cursor is
+    fetched in batches, but processed rows are only released once the
+    parent group they belong to is complete, so each parent is emitted
+    exactly once with its collection fully populated.
+
+    State (the single in-progress group, the set of already-emitted
+    group identities, and a queue of completed-but-unconsumed chunks)
+    intentionally lives on this object rather than in the ``chunks()``
+    generator.  A server-side cursor (``dynamic_yield_per``) recreates
+    the chunk iterator on every fetch in order to adjust the batch size,
+    so generator-local state would be lost and the trailing parent would
+    be re-emitted.
+
+    """
+
+    __slots__ = (
+        "context",
+        "cursor",
+        "process",
+        "single_entity",
+        "is_top_level",
+        "group_key_fn",
+        "_pending_key",
+        "_pending_row",
+        "_seen_groups",
+        "_completed_queue",
+        "_cursor_exhausted",
+    )
+
+    def __init__(
+        self,
+        context: "QueryContext",
+        cursor: "CursorResult[Unpack[TupleAny]]",
+        process: Sequence[Callable[[Any], Any]],
+        single_entity: bool,
+        is_top_level: bool,
+        group_key_fn: Callable[[Any], Any],
+    ):
+        self.context = context
+        self.cursor = cursor
+        self.process = process
+        self.single_entity = single_entity
+        self.is_top_level = is_top_level
+        self.group_key_fn = group_key_fn
+
+        self._pending_key: Any = None
+        self._pending_row: Any = _NO_PENDING_ROW
+        self._seen_groups: set = set()
+        self._completed_queue: List[List[Any]] = []
+        self._cursor_exhausted: bool = False
+
+    def _process_raw_rows(self, fetch: Sequence[Any]) -> List[Any]:
+        if self.single_entity:
+            proc = self.process[0]
+            return [proc(row) for row in fetch]
+        else:
+            return [
+                tuple([proc(row) for proc in self.process]) for row in fetch
+            ]
+
+    def _produce_chunk(self, size: Optional[int]) -> None:
+        """Pull one batch from the cursor and enqueue its completed groups.
+
+        The single in-progress parent group stays buffered.  When the
+        cursor is exhausted the trailing pending group, now known to be
+        complete, is enqueued as a final one-element chunk.
+
+        """
+        if self._cursor_exhausted:
+            return
+
+        context = self.context
+
+        # a fetch can consist entirely of rows for one (large) in-progress
+        # group, producing no completed chunk; keep fetching until at least
+        # one group completes or the cursor is exhausted.
+        while True:
+            fetch = self.cursor.fetchmany(size)
+
+            if not fetch:
+                self._cursor_exhausted = True
+                if self._pending_row is not _NO_PENDING_ROW:
+                    # the final group is now known to be complete; its
+                    # states already ran through the previous post-load
+                    # pass, so only the representative row is emitted.
+                    pending_row = self._pending_row
+                    self._pending_row = _NO_PENDING_ROW
+                    self._pending_key = None
+                    self._completed_queue.append([pending_row])
+                return
+
+            rows = self._process_raw_rows(fetch)
+
+            completed, self._pending_key, self._pending_row = (
+                _stream_collection_groups(
+                    rows,
+                    self.group_key_fn,
+                    self._pending_key,
+                    self._pending_row,
+                    self._seen_groups,
+                )
+            )
+
+            if completed:
+                # fire post-loads (e.g. selectinload) for the states
+                # encountered in this fetch, including the still-open
+                # group; those loaders are idempotent.  post-load paths
+                # are retained so they remain available for subsequent
+                # fetch batches.
+                if self.is_top_level:
+                    _invoke_top_level_post_loads(context)
+
+                self._completed_queue.append(completed)
+                return
+
+    def chunks(self, size: Optional[int]):
+        """Yield lists of processed, de-duplicated parent rows.
+
+        Completed chunks are enqueued on this chunker rather than held in
+        generator locals, so they survive the server-side cursor path
+        (``dynamic_yield_per``) which recreates this generator per fetch
+        in order to change the batch size.
+
+        """
+        while self._completed_queue or not self._cursor_exhausted:
+            if not self._completed_queue:
+                self._produce_chunk(size)
+                if not self._completed_queue:
+                    # cursor exhausted with nothing pending
+                    return
+            yield self._completed_queue.pop(0)
+
 
 def instances(
     cursor: CursorResult[Unpack[TupleAny]], context: QueryContext
@@ -121,15 +344,26 @@ def instances(
             )
         )
 
-        if context.yield_per and (
-            context.loaders_require_buffering
-            or context.loaders_require_uniquing
-        ):
+        # collection joinedload produces multiple rows per parent that
+        # normally require buffering/uniquing.  when using yield_per, the
+        # rows can instead be streamed as long as the rows for each parent
+        # identity are grouped contiguously in the result (e.g. the query
+        # orders by parent primary key).  Only the single parent group
+        # currently being assembled is buffered, rather than the whole
+        # result.  Loaders that genuinely require whole-result buffering
+        # such as subqueryload() remain unsupported.
+        stream_collection_uniquing = bool(
+            context.yield_per
+            and context.loaders_require_uniquing
+            and not context.loaders_require_buffering
+        )
+
+        if context.yield_per and context.loaders_require_buffering:
             raise sa_exc.InvalidRequestError(
-                "Can't use yield_per with eager loaders that require uniquing "
-                "or row buffering, e.g. joinedload() against collections "
-                "or subqueryload().  Consider the selectinload() strategy "
-                "for better flexibility in loading objects."
+                "Can't use yield_per with eager loaders that require "
+                "whole-result row buffering, e.g. subqueryload().  "
+                "Consider the selectinload() strategy for better "
+                "flexibility in loading objects."
             )
 
     except Exception:
@@ -185,10 +419,21 @@ def instances(
         nonlocal _uniquing_is_active
 
         if result._yield_per:
-            raise sa_exc.InvalidRequestError(
-                "Can't use the ORM yield_per feature "
-                "in conjunction with unique()"
-            )
+            if not stream_collection_uniquing:
+                raise sa_exc.InvalidRequestError(
+                    "Can't use the ORM yield_per feature "
+                    "in conjunction with unique()"
+                )
+            else:
+                # ORM-level streaming uniquing is already being applied
+                # row-by-row within the loading process (see
+                # ``_stream_collection_groups`` below), so a user-invoked
+                # unique() is a pass-through; the rows emitted are already
+                # unique by parent group.
+                _uniquing_is_active = True
+                return [
+                    None for ent in context.compile_state._entities
+                ]
 
         _uniquing_is_active = True
         return [
@@ -211,60 +456,141 @@ def instances(
         labels, extra, _create_unique_filters=_create_unique_filters
     )
 
-    def chunks(size):  # type: ignore
-        while True:
-            yield_per = size
+    if stream_collection_uniquing:
+        # Build a stable per-row grouping key.  Unlike the buffered
+        # ``Result.unique()`` path -- whose seen-set keeps the objects
+        # alive for the whole iteration -- streaming releases parents as
+        # they are yielded.  Grouping by ``id()`` would therefore be
+        # unsound: a yielded (and subsequently garbage-collected)
+        # parent's address could be reused by a later parent, producing a
+        # false "interleaved" rejection.  Mapper entities are instead
+        # grouped by their stable ORM identity key (primary key tuple);
+        # plain column values are grouped by value as in the normal
+        # uniqueness scheme.
+        def _stream_group_filter_for_entity(ent):
+            if ent.use_id_for_hash:
+                # a mapped ORM entity (the only entity that sets
+                # use_id_for_hash): group by its stable ORM identity key
+                # (identity class, primary key tuple, identity token)
+                # rather than the in-memory id(), which is not stable
+                # once a yielded parent has been garbage collected.  a
+                # NULL position in an outer-joined tuple row groups as
+                # None, matching the buffered unique() behavior of
+                # hashing a row containing None.
+                def orm_identity(obj):
+                    if obj is None:
+                        return None
+                    key = attributes.instance_state(obj).key
+                    return key if key is not None else id(obj)
 
-            context.partials = {}
+                return orm_identity
+            elif ent._non_hashable_value or ent._null_column_type:
+                return _not_hashable(
+                    ent.column.type,  # type: ignore
+                    legacy=context.load_options._legacy_uniquing,
+                    uncertain=ent._null_column_type,
+                )
+            else:
+                return None
 
-            if yield_per:
-                if _uniquing_is_active:
-                    raise sa_exc.InvalidRequestError(
-                        "Can't use the ORM yield_per feature "
-                        "in conjunction with unique()"
-                    )
-                fetch = cursor.fetchmany(yield_per)
+        _stream_entity_filters = [
+            _stream_group_filter_for_entity(ent)
+            for ent in context.compile_state._entities
+        ]
 
-                if not fetch:
+        if single_entity:
+
+            def _stream_group_key(row):
+                f = _stream_entity_filters[0]
+                return f(row) if f is not None else row
+
+        else:
+
+            def _stream_group_key(row):
+                return tuple(
+                    f(value) if f is not None else value
+                    for f, value in zip(_stream_entity_filters, row)
+                )
+
+    if stream_collection_uniquing:
+        # the "partials" collection and the joined-collection appenders
+        # stored in context.attributes must persist across fetch batches:
+        # rows for a parent that spans a batch boundary have to behave
+        # exactly like repeated rows for that parent within a single
+        # fetch, so that children continue to append to the same
+        # collection rather than replacing or starting a new one.
+        context.partials = {}
+
+        _streaming_chunker = _CollectionYieldPerChunker(
+            context=context,
+            cursor=cursor,
+            process=process,
+            single_entity=single_entity,
+            is_top_level=is_top_level,
+            group_key_fn=_stream_group_key,
+        )
+
+        def chunks(size):  # type: ignore
+            return _streaming_chunker.chunks(size)
+
+    else:
+
+        def chunks(size):  # type: ignore
+            while True:
+                yield_per = size
+
+                context.partials = {}
+
+                if yield_per:
+                    if _uniquing_is_active:
+                        raise sa_exc.InvalidRequestError(
+                            "Can't use the ORM yield_per feature "
+                            "in conjunction with unique()"
+                        )
+                    fetch = cursor.fetchmany(yield_per)
+
+                    if not fetch:
+                        break
+                else:
+                    fetch = cursor._raw_all_tuples()
+
+                if single_entity:
+                    proc = process[0]
+                    rows = [proc(row) for row in fetch]
+                else:
+                    rows = [
+                        tuple([proc(row) for proc in process])
+                        for row in fetch
+                    ]
+
+                # if we are the originating load from a query, meaning we
+                # aren't being called as a result of a nested "post load",
+                # iterate through all the collected post loaders and fire
+                # them off.  Previously this used to work recursively,
+                # however that prevented deeply nested structures from
+                # being loadable
+                if is_top_level:
+                    if yield_per:
+                        # if using yield per, memoize the state of the
+                        # collection so that it can be restored
+                        top_level_post_loads = list(
+                            context.post_load_paths.items()
+                        )
+
+                    while context.post_load_paths:
+                        post_loads = list(context.post_load_paths.items())
+                        context.post_load_paths.clear()
+                        for path, post_load in post_loads:
+                            post_load.invoke(context, path)
+
+                    if yield_per:
+                        context.post_load_paths.clear()
+                        context.post_load_paths.update(top_level_post_loads)
+
+                yield rows
+
+                if not yield_per:
                     break
-            else:
-                fetch = cursor._raw_all_tuples()
-
-            if single_entity:
-                proc = process[0]
-                rows = [proc(row) for row in fetch]
-            else:
-                rows = [
-                    tuple([proc(row) for proc in process]) for row in fetch
-                ]
-
-            # if we are the originating load from a query, meaning we
-            # aren't being called as a result of a nested "post load",
-            # iterate through all the collected post loaders and fire them
-            # off.  Previously this used to work recursively, however that
-            # prevented deeply nested structures from being loadable
-            if is_top_level:
-                if yield_per:
-                    # if using yield per, memoize the state of the
-                    # collection so that it can be restored
-                    top_level_post_loads = list(
-                        context.post_load_paths.items()
-                    )
-
-                while context.post_load_paths:
-                    post_loads = list(context.post_load_paths.items())
-                    context.post_load_paths.clear()
-                    for path, post_load in post_loads:
-                        post_load.invoke(context, path)
-
-                if yield_per:
-                    context.post_load_paths.clear()
-                    context.post_load_paths.update(top_level_post_loads)
-
-            yield rows
-
-            if not yield_per:
-                break
 
     if context.execution_options.get("prebuffer_rows", False):
         # this is a bit of a hack at the moment.
@@ -292,7 +618,7 @@ def instances(
     )
 
     # multi_row_eager_loaders OTOH is specific to joinedload.
-    if context.requires_uniquing:
+    if context.requires_uniquing and not stream_collection_uniquing:
 
         def require_unique(obj):
             raise sa_exc.InvalidRequestError(

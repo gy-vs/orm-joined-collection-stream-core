@@ -5609,35 +5609,94 @@ class YieldTest(_fixtures.FixtureTest):
         eq_(result.raw.cursor_strategy._max_row_buffer, 15)
         eq_(len(result.all()), 4)
 
-    def test_no_joinedload_opt(self):
+    def test_joinedload_opt_yield_per(self):
+        """collection joinedload may be streamed with yield_per.
+
+        The rows for each parent identity must be grouped contiguously
+        (the default eager join groups rows by parent), and each parent
+        is yielded exactly once with its collection fully populated.
+
+        """
         self._eagerload_mappings()
 
         User = self.classes.User
+
+        # the buffered query is the reference; streaming must produce the
+        # same parents with the same complete collections.
+        sess = fixture_session()
+        expected = [
+            (u.id, [a.id for a in u.addresses])
+            for u in sess.query(User)
+            .options(joinedload(User.addresses))
+            .order_by(User.id)
+        ]
+
         sess = fixture_session()
         q = sess.query(User).options(joinedload(User.addresses)).yield_per(1)
-        assert_raises_message(
-            sa_exc.InvalidRequestError,
-            "Can't use yield_per with eager loaders that require "
-            "uniquing or row buffering",
-            q.all,
+        eq_(
+            [
+                (u.id, [a.id for a in u.addresses])
+                for u in q.order_by(User.id)
+            ],
+            expected,
+        )
+
+    def test_joinedload_opt_yield_per_chunk_smaller_than_collection(self):
+        """a parent collection may span more rows than the yield_per size."""
+        self._eagerload_mappings()
+
+        User = self.classes.User
+
+        # user 8 has three addresses; with yield_per=2 its rows arrive in
+        # separate fetch batches and must still be assembled into one
+        # complete collection / one yielded parent.
+        sess = fixture_session()
+        expected = [
+            (u.id, [a.id for a in u.addresses])
+            for u in sess.query(User)
+            .options(joinedload(User.addresses))
+            .order_by(User.id)
+        ]
+
+        sess = fixture_session()
+        q = sess.query(User).options(joinedload(User.addresses)).yield_per(2)
+
+        eq_(
+            [
+                (u.id, [a.id for a in u.addresses])
+                for u in q.order_by(User.id)
+            ],
+            expected,
         )
 
     def test_no_contains_eager_opt(self):
         self._eagerload_mappings()
 
         User = self.classes.User
+
+        sess = fixture_session()
+        expected = [
+            (u.id, [a.id for a in u.addresses])
+            for u in sess.query(User)
+            .join(User.addresses)
+            .options(contains_eager(User.addresses))
+            .order_by(User.id)
+        ]
+
         sess = fixture_session()
         q = (
             sess.query(User)
             .join(User.addresses)
             .options(contains_eager(User.addresses))
+            .order_by(User.id)
             .yield_per(1)
         )
-        assert_raises_message(
-            sa_exc.InvalidRequestError,
-            "Can't use yield_per with eager loaders that require "
-            "uniquing or row buffering",
-            q.all,
+        eq_(
+            [
+                (u.id, [a.id for a in u.addresses])
+                for u in q
+            ],
+            expected,
         )
 
     def test_no_subqueryload_opt(self):
@@ -5649,7 +5708,7 @@ class YieldTest(_fixtures.FixtureTest):
         assert_raises_message(
             sa_exc.InvalidRequestError,
             "Can't use yield_per with eager loaders that require "
-            "uniquing or row buffering",
+            "whole-result row buffering",
             q.all,
         )
 
@@ -5662,7 +5721,7 @@ class YieldTest(_fixtures.FixtureTest):
         assert_raises_message(
             sa_exc.InvalidRequestError,
             "Can't use yield_per with eager loaders that require "
-            "uniquing or row buffering",
+            "whole-result row buffering",
             q.all,
         )
 
@@ -5805,6 +5864,241 @@ class YieldTest(_fixtures.FixtureTest):
             next(result)
 
         result.close()
+
+
+class JoinedEagerCollectionYieldPerTest(_fixtures.FixtureTest):
+    """Test streaming (yield_per) collection joined eager loads.
+
+    A collection joinedload emits multiple rows per parent.  With
+    yield_per the ORM must still deliver each parent exactly once, with
+    its complete collection, while fetching the cursor in batches --
+    without buffering the entire result set.
+
+    Uses the stock users/addresses fixture: user 7 has one address,
+    user 8 has three (ids 2, 3, 4), user 9 has one (id 5) and user 10
+    has none (a single LEFT OUTER JOIN row).
+
+    """
+
+    run_setup_mappers = "each"
+    run_inserts = "each"
+    run_deletes = "each"
+
+    __sparse_driver_backend__ = True
+
+    def _mappings(self):
+        User, Address = self.classes("User", "Address")
+        users, addresses = self.tables("users", "addresses")
+        self.mapper_registry.map_imperatively(
+            User,
+            users,
+            properties={"addresses": relationship(Address)},
+        )
+        self.mapper_registry.map_imperatively(Address, addresses)
+
+    def _buffered_reference(self):
+        User = self.classes.User
+        sess = fixture_session()
+        return [
+            (u.id, [a.id for a in u.addresses])
+            for u in sess.execute(
+                select(User).options(joinedload(User.addresses)).order_by(User.id)
+            ).unique().scalars()
+        ]
+
+    @testing.combinations((1,), (2,), (3,), (5,), (100,), argnames="yield_per")
+    def test_streaming_matches_buffered(self, yield_per):
+        self._mappings()
+        expected = self._buffered_reference()
+
+        User = self.classes.User
+        sess = fixture_session()
+        result = sess.execute(
+            select(User)
+            .options(joinedload(User.addresses))
+            .order_by(User.id)
+            .execution_options(yield_per=yield_per)
+        )
+        eq_(
+            [
+                (u.id, [a.id for a in u.addresses])
+                for u in result.scalars()
+            ],
+            expected,
+        )
+
+    @testing.combinations((1,), (2,), (3,), (100,), argnames="yield_per")
+    def test_streaming_explicit_unique_is_pass_through(self, yield_per):
+        self._mappings()
+        expected = self._buffered_reference()
+
+        User = self.classes.User
+        sess = fixture_session()
+        result = sess.execute(
+            select(User)
+            .options(joinedload(User.addresses))
+            .order_by(User.id)
+            .execution_options(yield_per=yield_per)
+        )
+        eq_(
+            [
+                (u.id, [a.id for a in u.addresses])
+                for u in result.unique().scalars()
+            ],
+            expected,
+        )
+
+    def test_parent_yielded_once(self):
+        self._mappings()
+        User = self.classes.User
+        sess = fixture_session()
+        result = sess.execute(
+            select(User)
+            .options(joinedload(User.addresses))
+            .order_by(User.id)
+            .execution_options(yield_per=1)
+        )
+        ids = [u.id for u in result.scalars()]
+        eq_(ids, [7, 8, 9, 10])
+        eq_(len(ids), len(set(ids)))
+
+    def test_collection_spans_batches(self):
+        """user 8's 3-address collection exceeds yield_per rows."""
+        self._mappings()
+        User = self.classes.User
+        sess = fixture_session()
+        result = sess.execute(
+            select(User)
+            .options(joinedload(User.addresses))
+            .order_by(User.id)
+            .execution_options(yield_per=2)
+        )
+        users = list(result.scalars())
+        ed = next(u for u in users if u.id == 8)
+        # all three addresses present even though they span fetch batches
+        eq_(sorted(a.id for a in ed.addresses), [2, 3, 4])
+
+    def test_fetchmany_and_fetchone(self):
+        self._mappings()
+        expected = [
+            (i, sorted(ids)) for i, ids in self._buffered_reference()
+        ]
+        User = self.classes.User
+
+        sess = fixture_session()
+        result = sess.execute(
+            select(User)
+            .options(joinedload(User.addresses))
+            .order_by(User.id)
+            .execution_options(yield_per=2)
+        )
+        via_many = []
+        while True:
+            batch = result.fetchmany(2)
+            if not batch:
+                break
+            via_many.extend(
+                (u.id, sorted(a.id for a in u.addresses)) for (u,) in batch
+            )
+
+        sess = fixture_session()
+        result = sess.execute(
+            select(User)
+            .options(joinedload(User.addresses))
+            .order_by(User.id)
+            .execution_options(yield_per=2)
+        )
+        via_one = []
+        while True:
+            row = result.fetchone()
+            if row is None:
+                break
+            (u,) = row
+            via_one.append((u.id, sorted(a.id for a in u.addresses)))
+
+        eq_(via_many, expected)
+        eq_(via_one, expected)
+
+    def test_interrupted_iteration_closes(self):
+        """stopping consumption early closes the cursor cleanly."""
+        self._mappings()
+        User = self.classes.User
+        sess = fixture_session()
+        result = sess.execute(
+            select(User)
+            .options(joinedload(User.addresses))
+            .order_by(User.id)
+            .execution_options(yield_per=1)
+        )
+        iterator = iter(result.scalars())
+        first = next(iterator)
+        eq_(first.id, 7)
+        eq_([a.id for a in first.addresses], [1])
+        result.close()
+
+    def test_interleaved_rows_rejected(self):
+        """non-contiguous parent rows cannot be streamed correctly."""
+        self._mappings()
+        User, Address = self.classes("User", "Address")
+
+        # order the eagerly-joined address rows so that user rows
+        # interleave: u8(addr2), u7(addr1), u8(addr3), u8(addr4), u9.
+        # streaming cannot know u8 will reappear, so this is rejected.
+        ordering = case(
+            (Address.id == 2, 0),
+            (Address.id == 1, 1),
+            (Address.id == 3, 2),
+            (Address.id == 4, 3),
+            else_=4,
+        )
+        sess = fixture_session()
+        with expect_raises_message(
+            sa_exc.InvalidRequestError,
+            "not grouped contiguously",
+        ):
+            result = sess.execute(
+                select(User)
+                .join(User.addresses)
+                .options(joinedload(User.addresses))
+                .order_by(ordering)
+                .execution_options(yield_per=1)
+            )
+            list(result.scalars())
+
+    def test_subqueryload_still_rejected(self):
+        self._mappings()
+        User = self.classes.User
+        sess = fixture_session()
+        with expect_raises_message(
+            sa_exc.InvalidRequestError, "whole-result row buffering"
+        ):
+            sess.execute(
+                select(User)
+                .options(subqueryload(User.addresses))
+                .execution_options(yield_per=1)
+            )
+
+    def test_stream_results_server_side_cursor(self):
+        """dynamic yield_per / server-side cursor must not re-emit."""
+        self._mappings()
+        expected = [
+            (i, sorted(ids)) for i, ids in self._buffered_reference()
+        ]
+        User = self.classes.User
+        sess = fixture_session()
+        result = sess.execute(
+            select(User)
+            .options(joinedload(User.addresses))
+            .order_by(User.id)
+            .execution_options(yield_per=2, stream_results=True)
+        )
+        eq_(
+            [
+                (u.id, sorted(a.id for a in u.addresses))
+                for u in result.scalars()
+            ],
+            expected,
+        )
 
 
 class YieldIterationTest(_fixtures.FixtureTest):

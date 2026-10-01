@@ -4,6 +4,7 @@ import contextlib
 from typing import List
 from typing import Optional
 
+from sqlalchemy import case
 from sqlalchemy import event
 from sqlalchemy import exc
 from sqlalchemy import ForeignKey
@@ -25,6 +26,7 @@ from sqlalchemy.ext.asyncio import close_all_sessions
 from sqlalchemy.ext.asyncio import exc as async_exc
 from sqlalchemy.ext.asyncio.base import ReversibleProxy
 from sqlalchemy.orm import DeclarativeBase
+from sqlalchemy.orm import joinedload
 from sqlalchemy.orm import Mapped
 from sqlalchemy.orm import mapped_column
 from sqlalchemy.orm import relationship
@@ -605,6 +607,110 @@ class AsyncSessionQueryTest(AsyncFixture):
                 self.static.user_address_result[3:],
             ],
         )
+
+    @async_test
+    @testing.requires.independent_cursors
+    @testing.combinations((1,), (2,), (5,), argnames="yield_per")
+    async def test_stream_joined_collection_yield_per(
+        self, async_session, yield_per
+    ):
+        """collection joinedload streamed with yield_per over AsyncSession.
+
+        Mirrors the synchronous
+        JoinedEagerCollectionYieldPerTest semantics: each parent is
+        delivered once with its complete collection while the server-side
+        cursor is fetched in batches.
+
+        """
+        User = self.classes.User
+
+        result = await async_session.stream(
+            select(User)
+            .options(joinedload(User.addresses))
+            .order_by(User.id),
+            execution_options={"yield_per": yield_per},
+        )
+        rows = [(u.id, [a.id for a in u.addresses]) async for u in result.scalars()]
+        eq_(
+            rows,
+            [
+                (u.id, [a.id for a in u.addresses])
+                for u in self.static.user_address_result
+            ],
+        )
+
+    @async_test
+    @testing.requires.independent_cursors
+    async def test_stream_joined_collection_yield_per_unique(
+        self, async_session
+    ):
+        """explicit unique() remains a pass-through under streaming."""
+        User = self.classes.User
+
+        result = await async_session.stream(
+            select(User)
+            .options(joinedload(User.addresses))
+            .order_by(User.id),
+            execution_options={"yield_per": 2},
+        )
+        rows = [
+            (u.id, [a.id for a in u.addresses])
+            async for u in result.scalars().unique()
+        ]
+        eq_(
+            rows,
+            [
+                (u.id, [a.id for a in u.addresses])
+                for u in self.static.user_address_result
+            ],
+        )
+
+    @async_test
+    @testing.requires.independent_cursors
+    async def test_stream_joined_collection_interleaved_rejected(
+        self, async_session
+    ):
+        """interleaved parent rows are rejected on the async path too."""
+        User, Address = self.classes("User", "Address")
+
+        ordering = case(
+            (Address.id == 2, 0),
+            (Address.id == 1, 1),
+            (Address.id == 3, 2),
+            (Address.id == 4, 3),
+            else_=4,
+        )
+
+        with expect_raises_message(
+            exc.InvalidRequestError, "not grouped contiguously"
+        ):
+            result = await async_session.stream(
+                select(User)
+                .join(User.addresses)
+                .options(joinedload(User.addresses))
+                .order_by(ordering),
+                execution_options={"yield_per": 1},
+            )
+            await result.scalars().all()
+
+    @async_test
+    @testing.requires.independent_cursors
+    async def test_stream_joined_collection_early_close(self, async_session):
+        User = self.classes.User
+
+        result = await async_session.stream(
+            select(User)
+            .options(joinedload(User.addresses))
+            .order_by(User.id),
+            execution_options={"yield_per": 1},
+        )
+        seen = []
+        async for u in result.scalars():
+            seen.append(u.id)
+            if len(seen) == 2:
+                break
+        await result.close()
+        eq_(seen, [7, 8])
 
     @testing.combinations("statement", "execute", argnames="location")
     @async_test
